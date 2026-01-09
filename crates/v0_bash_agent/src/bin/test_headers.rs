@@ -9,8 +9,7 @@ use std::env;
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    let api_key = env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))?;
+    let api_key = env::var("ANTHROPIC_API_KEY").or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))?;
     let base_url = env::var("ANTHROPIC_API_BASE")
         .or_else(|_| env::var("ANTHROPIC_BASE_URL"))
         .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
@@ -27,7 +26,12 @@ async fn main() -> Result<()> {
     ];
 
     for (i, (user_agent, origin)) in test_cases.iter().enumerate() {
-        println!("Test {}: User-Agent: {:?}, Origin: {:?}", i + 1, user_agent, origin);
+        println!(
+            "Test {}: User-Agent: {:?}, Origin: {:?}",
+            i + 1,
+            user_agent,
+            origin
+        );
 
         let client = reqwest::Client::new();
         let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));

@@ -97,7 +97,12 @@ pub fn execute_bash(command: &str) -> String {
 ///
 /// Returns:
 ///     Final text response from the model
-pub async fn chat(client: &Client, model: &str, prompt: &str, history: &mut Vec<Message>) -> Result<String> {
+pub async fn chat(
+    client: &Client,
+    model: &str,
+    prompt: &str,
+    history: &mut Vec<Message>,
+) -> Result<String> {
     let tools = vec![get_bash_tool()];
     let system = get_system_prompt();
 

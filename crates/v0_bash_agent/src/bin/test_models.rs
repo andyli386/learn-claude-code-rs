@@ -22,10 +22,7 @@ async fn main() -> Result<()> {
     println!("Base URL: {}\n", base_url);
 
     // Claude 4.5 models to test
-    let models = vec![
-        "claude-sonnet-4-5-20250929",
-        "claude-opus-4-5-20251101",
-    ];
+    let models = vec!["claude-sonnet-4-5-20250929", "claude-opus-4-5-20251101"];
 
     let client = reqwest::Client::new();
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));

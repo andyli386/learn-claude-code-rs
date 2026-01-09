@@ -27,9 +27,7 @@ fn test_bash_tool_structure() {
     // Verify required contains "command"
     if let Some(required) = schema.get("required") {
         if let Some(required_array) = required.as_array() {
-            assert!(required_array
-                .iter()
-                .any(|v| v.as_str() == Some("command")));
+            assert!(required_array.iter().any(|v| v.as_str() == Some("command")));
         }
     }
 }

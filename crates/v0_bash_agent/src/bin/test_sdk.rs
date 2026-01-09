@@ -2,7 +2,6 @@
 //! Direct SDK test to isolate the issue
 
 use anthropic::types::{ContentBlock, Message, MessagesRequestBuilder, Role, Tool};
-use anthropic::Client;
 use anyhow::Result;
 use serde_json::json;
 use std::env;
@@ -13,15 +12,13 @@ async fn main() -> Result<()> {
 
     println!("=== Direct SDK Test ===\n");
 
-    let api_key = env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))?;
+    let api_key = env::var("ANTHROPIC_API_KEY").or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))?;
 
     let base_url = env::var("ANTHROPIC_API_BASE")
         .or_else(|_| env::var("ANTHROPIC_BASE_URL"))
         .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
 
-    let model = env::var("MODEL_NAME")
-        .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string());
+    let model = env::var("MODEL_NAME").unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string());
 
     println!("Base URL: {}", base_url);
     println!("Model: {}\n", model);

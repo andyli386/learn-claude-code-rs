@@ -43,11 +43,11 @@
 //! Usage:
 //!     cargo run --bin v1_basic_agent
 
-use anyhow::{Context, Result};
 use anthropic::types::{
     ContentBlock, Message, MessagesRequestBuilder, Role, StopReason, SystemPrompt, Tool,
 };
 use anthropic::Client;
+use anyhow::{Context, Result};
 use colored::Colorize;
 use serde_json::json;
 use std::env;
@@ -69,13 +69,11 @@ impl Config {
     fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
 
-        let model = env::var("MODEL_NAME").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+        let model =
+            env::var("MODEL_NAME").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
         let workdir = env::current_dir().context("Failed to get current directory")?;
 
-        Ok(Self {
-            model,
-            workdir,
-        })
+        Ok(Self { model, workdir })
     }
 
     fn system_prompt(&self) -> String {
@@ -104,7 +102,8 @@ fn create_tools() -> Vec<Tool> {
         // Can run any command: git, npm, python, curl, etc.
         Tool {
             name: "bash".to_string(),
-            description: "Run a shell command. Use for: ls, find, grep, git, npm, python, etc.".to_string(),
+            description: "Run a shell command. Use for: ls, find, grep, git, npm, python, etc."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -140,7 +139,8 @@ fn create_tools() -> Vec<Tool> {
         // Creates parent directories automatically
         Tool {
             name: "write_file".to_string(),
-            description: "Write content to a file. Creates parent directories if needed.".to_string(),
+            description: "Write content to a file. Creates parent directories if needed."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -268,7 +268,8 @@ fn run_read(workdir: &Path, path: &str, limit: Option<i64>) -> String {
 
                 let output = if let Some(limit) = limit {
                     if limit > 0 && (limit as usize) < total_lines {
-                        let limited_lines: Vec<&str> = lines.iter().take(limit as usize).copied().collect();
+                        let limited_lines: Vec<&str> =
+                            lines.iter().take(limit as usize).copied().collect();
                         format!(
                             "{}\n... ({} more lines)",
                             limited_lines.join("\n"),
@@ -415,11 +416,7 @@ fn execute_tool(workdir: &Path, name: &str, input: &serde_json::Value) -> String
 ///   1. Model decides which tools, in what order, when to stop
 ///   2. Tool results provide feedback for next decision
 ///   3. Conversation history maintains context across turns
-async fn agent_loop(
-    client: &Client,
-    config: &Config,
-    messages: &mut Vec<Message>,
-) -> Result<()> {
+async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message>) -> Result<()> {
     let tools = create_tools();
 
     loop {
@@ -460,7 +457,12 @@ async fn agent_loop(
         let mut results = Vec::new();
         for (id, name, input) in tool_calls {
             // Display what's being executed
-            println!("\n{} {}: {:?}", ">".bright_blue(), name.bright_yellow(), input);
+            println!(
+                "\n{} {}: {:?}",
+                ">".bright_blue(),
+                name.bright_yellow(),
+                input
+            );
 
             // Execute and show result preview
             let output = execute_tool(&config.workdir, &name, &input);
@@ -508,7 +510,10 @@ async fn main() -> Result<()> {
     // Initialize client - from_env() handles both API_KEY and BASE_URL
     let client = Client::from_env()?;
 
-    println!("{}", format!("Mini Claude Code v1 - {}", config.workdir.display()).bright_green());
+    println!(
+        "{}",
+        format!("Mini Claude Code v1 - {}", config.workdir.display()).bright_green()
+    );
     println!("{}\n", "Type 'exit' to quit.".bright_black());
 
     let mut history: Vec<Message> = Vec::new();
@@ -521,7 +526,9 @@ async fn main() -> Result<()> {
         io::stdin().read_line(&mut user_input)?;
         let user_input = user_input.trim();
 
-        if user_input.is_empty() || matches!(user_input.to_lowercase().as_str(), "exit" | "quit" | "q") {
+        if user_input.is_empty()
+            || matches!(user_input.to_lowercase().as_str(), "exit" | "quit" | "q")
+        {
             break;
         }
 

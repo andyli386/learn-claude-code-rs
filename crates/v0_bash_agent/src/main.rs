@@ -61,12 +61,15 @@ fn create_client() -> Result<Client> {
     // Try standard env vars first, then fallback to alternative names
     let api_key = env::var("ANTHROPIC_API_KEY")
         .or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))
-        .map_err(|_| anyhow::anyhow!("Missing API key: set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN"))?;
+        .map_err(|_| {
+            anyhow::anyhow!("Missing API key: set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN")
+        })?;
 
     let mut builder = anthropic::client::ClientBuilder::new().api_key(api_key);
 
     // Try both ANTHROPIC_API_BASE and ANTHROPIC_BASE_URL
-    if let Ok(base_url) = env::var("ANTHROPIC_API_BASE").or_else(|_| env::var("ANTHROPIC_BASE_URL")) {
+    if let Ok(base_url) = env::var("ANTHROPIC_API_BASE").or_else(|_| env::var("ANTHROPIC_BASE_URL"))
+    {
         builder = builder.api_base(base_url);
     }
 
@@ -129,7 +132,10 @@ fn print_model_info(model: &str) {
         "Custom model"
     };
 
-    println!("{}", format!("🤖 Using model: {} ({})", model_name, model).bright_blue());
+    println!(
+        "{}",
+        format!("🤖 Using model: {} ({})", model_name, model).bright_blue()
+    );
 }
 
 /// Main entry point
@@ -147,7 +153,10 @@ async fn main() -> Result<()> {
     } else {
         // Interactive REPL mode
         print_model_info(&model);
-        println!("{}", "Type 'q' or 'exit' to quit. Type 'help' for usage examples.\n".bright_black());
+        println!(
+            "{}",
+            "Type 'q' or 'exit' to quit. Type 'help' for usage examples.\n".bright_black()
+        );
 
         let mut history = vec![];
         loop {

@@ -9,8 +9,7 @@ use std::env;
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    let api_key = env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))?;
+    let api_key = env::var("ANTHROPIC_API_KEY").or_else(|_| env::var("ANTHROPIC_AUTH_TOKEN"))?;
     let base_url = env::var("ANTHROPIC_API_BASE")
         .or_else(|_| env::var("ANTHROPIC_BASE_URL"))
         .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
@@ -95,7 +94,14 @@ async fn main() -> Result<()> {
 
     let status2 = response2.status();
     println!("Response status: {}", status2);
-    println!("Result: {}", if status2.is_success() { "✓ SUCCESS" } else { "✗ FAILED" });
+    println!(
+        "Result: {}",
+        if status2.is_success() {
+            "✓ SUCCESS"
+        } else {
+            "✗ FAILED"
+        }
+    );
 
     println!("\n=== Analysis ===");
     println!("If Test 1 fails but Test 2 succeeds, NewAPI restricts tools usage.");
