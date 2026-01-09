@@ -1,0 +1,43 @@
+[package]
+name = "v0_bash_agent"
+version = "0.1.0"
+edition = "2021"
+default-run = "v0_bash_agent"
+
+[lib]
+name = "v0_bash_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "v0_bash_agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "debug"
+path = "src/bin/debug.rs"
+
+[[bin]]
+name = "test_models"
+path = "src/bin/test_models.rs"
+
+[[bin]]
+name = "test_sdk"
+path = "src/bin/test_sdk.rs"
+
+[[bin]]
+name = "test_headers"
+path = "src/bin/test_headers.rs"
+
+[[bin]]
+name = "compare_requests"
+path = "src/bin/compare_requests.rs"
+
+[dependencies]
+anthropic = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dotenvy = { workspace = true }
+anyhow = { workspace = true }
+colored = { workspace = true }
+reqwest = { workspace = true }
