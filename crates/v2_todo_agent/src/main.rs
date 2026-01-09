@@ -1,47 +1,50 @@
-//! v1_basic_agent - Mini Claude Code: Model as Agent (~300 lines)
+//! v2_todo_agent - Mini Claude Code: Structured Planning (~500 lines)
 //!
-//! Core Philosophy: "The Model IS the Agent"
-//! =========================================
-//! The secret of Claude Code, Cursor Agent, Codex CLI? There is no secret.
+//! Core Philosophy: "Make Plans Visible"
+//! =====================================
+//! v1 works great for simple tasks. But ask it to "refactor auth, add tests,
+//! update docs" and watch what happens. Without explicit planning, the model:
+//!   - Jumps between tasks randomly
+//!   - Forgets completed steps
+//!   - Loses focus mid-way
 //!
-//! Strip away the CLI polish, progress bars, permission systems. What remains
-//! is surprisingly simple: a LOOP that lets the model call tools until done.
+//! The Problem - "Context Fade":
+//! ----------------------------
+//! In v1, plans exist only in the model's "head":
 //!
-//! Traditional Assistant:
-//!     User -> Model -> Text Response
+//!     v1: "I'll do A, then B, then C"  (invisible)
+//!         After 10 tool calls: "Wait, what was I doing?"
 //!
-//! Agent System:
-//!     User -> Model -> [Tool -> Result]* -> Response
-//!                           ^________|
+//! The Solution - TodoWrite Tool:
+//! -----------------------------
+//! v2 adds ONE new tool that fundamentally changes how the agent works:
 //!
-//! The asterisk (*) matters! The model calls tools REPEATEDLY until it decides
-//! the task is complete. This transforms a chatbot into an autonomous agent.
+//!     v2:
+//!       [ ] Refactor auth module
+//!       [>] Add unit tests         <- Currently working on this
+//!       [ ] Update documentation
 //!
-//! KEY INSIGHT: The model is the decision-maker. Code just provides tools and
-//! runs the loop. The model decides:
-//!   - Which tools to call
-//!   - In what order
-//!   - When to stop
+//! Now both YOU and the MODEL can see the plan. The model can:
+//!   - Update status as it works
+//!   - See what's done and what's next
+//!   - Stay focused on one task at a time
 //!
-//! The Four Essential Tools:
-//! ------------------------
-//! Claude Code has ~20 tools. But these 4 cover 90% of use cases:
+//! Key Constraints (not arbitrary - these are guardrails):
+//! ------------------------------------------------------
+//!     | Rule              | Why                              |
+//!     |-------------------|----------------------------------|
+//!     | Max 20 items      | Prevents infinite task lists     |
+//!     | One in_progress   | Forces focus on one thing        |
+//!     | Required fields   | Ensures structured output        |
 //!
-//!     | Tool       | Purpose              | Example                    |
-//!     |------------|----------------------|----------------------------|
-//!     | bash       | Run any command      | npm install, git status    |
-//!     | read_file  | Read file contents   | View src/index.ts          |
-//!     | write_file | Create/overwrite     | Create README.md           |
-//!     | edit_file  | Surgical changes     | Replace a function         |
+//! The Deep Insight:
+//! ----------------
+//! > "Structure constrains AND enables."
 //!
-//! With just these 4 tools, the model can:
-//!   - Explore codebases (bash: find, grep, ls)
-//!   - Understand code (read_file)
-//!   - Make changes (write_file, edit_file)
-//!   - Run anything (bash: python, npm, make)
+//! Todo constraints (max items, one in_progress) ENABLE (visible plan, tracked progress).
 //!
 //! Usage:
-//!     cargo run --bin v1_basic_agent
+//!     cargo run -p v2_todo_agent
 
 use anthropic::types::{
     ContentBlock, Message, MessagesRequestBuilder, Role, StopReason, SystemPrompt, Tool,
@@ -49,12 +52,24 @@ use anthropic::types::{
 use anthropic::Client;
 use anyhow::{Context, Result};
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+#[cfg(not(feature = "readline"))]
+use std::io::BufRead;
+
+#[cfg(feature = "readline")]
+use rustyline::error::ReadlineError;
+#[cfg(feature = "readline")]
+use rustyline::history::DefaultHistory;
+#[cfg(feature = "readline")]
+use rustyline::Editor;
 
 // =============================================================================
 // Configuration
@@ -80,30 +95,174 @@ impl Config {
         format!(
             r#"You are a coding agent at {}.
 
-Loop: think briefly -> use tools -> report results.
+WORKFLOW (Required for multi-step tasks):
+1. PLAN: Use TodoWrite to create a visible task list
+2. ACT: Execute tools to complete current task
+3. UPDATE: Mark tasks complete, move to next
+4. REPORT: Summarize what changed when done
 
-Rules:
-- Prefer tools over prose. Act, don't just explain.
-- Never invent file paths. Use bash ls/find first if unsure.
-- Make minimal changes. Don't over-engineer.
-- After finishing, summarize what changed."#,
+TODO RULES (Enforced):
+- Use TodoWrite for ANY task with 2+ steps
+- Maximum 20 todo items (forces focused planning)
+- Only ONE task can be "in_progress" at a time (enforces focus)
+- Required fields for each item:
+  * content: "What to do" (clear description)
+  * status: "pending" | "in_progress" | "completed"
+  * activeForm: "Doing it now" (present tense, shown during work)
+
+TODO BEST PRACTICES:
+- Mark task "in_progress" BEFORE starting work
+- Mark task "completed" IMMEDIATELY after finishing
+- Update activeForm to show current action
+- Break large tasks into smaller steps
+- Remove or mark completed tasks that are no longer relevant
+
+TOOL USAGE:
+- Prefer tools over explanations (ACT, don't just describe)
+- Use bash for exploration: ls, find, grep, git
+- Use read_file to understand code before changing
+- Use edit_file for surgical changes, write_file for new files
+- Never invent file paths - verify with bash first
+
+OUTPUT:
+- After completing all tasks, provide a brief summary
+- Focus on what changed, not what you did
+"#,
             self.workdir.display()
         )
     }
 }
 
 // =============================================================================
-// Tool Definitions - 4 tools cover 90% of coding tasks
+// TodoManager - The core addition in v2
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TodoItem {
+    content: String,
+    status: TodoStatus,
+    #[serde(rename = "activeForm")]
+    active_form: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// Manages a structured task list with enforced constraints.
+///
+/// Key Design Decisions:
+/// --------------------
+/// 1. Max 20 items: Prevents the model from creating endless lists
+/// 2. One in_progress: Forces focus - can only work on ONE thing at a time
+/// 3. Required fields: Each item needs content, status, and activeForm
+///
+/// The activeForm field deserves explanation:
+/// - It's the PRESENT TENSE form of what's happening
+/// - Shown when status is "in_progress"
+/// - Example: content="Add tests", activeForm="Adding unit tests..."
+///
+/// This gives real-time visibility into what the agent is doing.
+struct TodoManager {
+    items: Arc<Mutex<Vec<TodoItem>>>,
+}
+
+impl TodoManager {
+    fn new() -> Self {
+        Self {
+            items: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Validate and update the todo list.
+    ///
+    /// The model sends a complete new list each time. We validate it,
+    /// store it, and return a rendered view that the model will see.
+    ///
+    /// Validation Rules:
+    /// - Each item must have: content, status, activeForm
+    /// - Status must be: pending | in_progress | completed
+    /// - Only ONE item can be in_progress at a time
+    /// - Maximum 20 items allowed
+    fn update(&self, new_items: Vec<TodoItem>) -> Result<String> {
+        let mut in_progress_count = 0;
+
+        // Validate items
+        for (i, item) in new_items.iter().enumerate() {
+            if item.content.trim().is_empty() {
+                anyhow::bail!("Item {}: content required", i);
+            }
+            if item.active_form.trim().is_empty() {
+                anyhow::bail!("Item {}: activeForm required", i);
+            }
+            if item.status == TodoStatus::InProgress {
+                in_progress_count += 1;
+            }
+        }
+
+        // Enforce constraints
+        if new_items.len() > 20 {
+            anyhow::bail!("Max 20 todos allowed");
+        }
+        if in_progress_count > 1 {
+            anyhow::bail!("Only one task can be in_progress at a time");
+        }
+
+        // Update stored items
+        *self.items.lock().unwrap() = new_items;
+
+        Ok(self.render())
+    }
+
+    /// Render the todo list as human-readable text.
+    ///
+    /// Format:
+    ///     [x] Completed task
+    ///     [>] In progress task <- Doing something...
+    ///     [ ] Pending task
+    ///
+    ///     (2/3 completed)
+    fn render(&self) -> String {
+        let items = self.items.lock().unwrap();
+
+        if items.is_empty() {
+            return "No todos.".to_string();
+        }
+
+        let mut lines = Vec::new();
+        for item in items.iter() {
+            let line = match item.status {
+                TodoStatus::Completed => format!("[x] {}", item.content),
+                TodoStatus::InProgress => format!("[>] {} <- {}", item.content, item.active_form),
+                TodoStatus::Pending => format!("[ ] {}", item.content),
+            };
+            lines.push(line);
+        }
+
+        let completed = items
+            .iter()
+            .filter(|t| t.status == TodoStatus::Completed)
+            .count();
+        lines.push(format!("\n({}/{} completed)", completed, items.len()));
+
+        lines.join("\n")
+    }
+}
+
+// =============================================================================
+// Tool Definitions (v1 tools + TodoWrite)
 // =============================================================================
 
 fn create_tools() -> Vec<Tool> {
     vec![
-        // Tool 1: Bash - The gateway to everything
-        // Can run any command: git, npm, python, curl, etc.
+        // v1 tools (unchanged)
         Tool {
             name: "bash".to_string(),
-            description: "Run a shell command. Use for: ls, find, grep, git, npm, python, etc."
-                .to_string(),
+            description: "Run a shell command.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -115,11 +274,9 @@ fn create_tools() -> Vec<Tool> {
                 "required": ["command"]
             }),
         },
-        // Tool 2: Read File - For understanding existing code
-        // Returns file content with optional line limit for large files
         Tool {
             name: "read_file".to_string(),
-            description: "Read file contents. Returns UTF-8 text.".to_string(),
+            description: "Read file contents.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -135,12 +292,9 @@ fn create_tools() -> Vec<Tool> {
                 "required": ["path"]
             }),
         },
-        // Tool 3: Write File - For creating new files or complete rewrites
-        // Creates parent directories automatically
         Tool {
             name: "write_file".to_string(),
-            description: "Write content to a file. Creates parent directories if needed."
-                .to_string(),
+            description: "Write content to file.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -156,11 +310,9 @@ fn create_tools() -> Vec<Tool> {
                 "required": ["path", "content"]
             }),
         },
-        // Tool 4: Edit File - For surgical changes to existing code
-        // Uses exact string matching for precise edits
         Tool {
             name: "edit_file".to_string(),
-            description: "Replace exact text in a file. Use for surgical edits.".to_string(),
+            description: "Replace exact text in file.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -178,6 +330,40 @@ fn create_tools() -> Vec<Tool> {
                     }
                 },
                 "required": ["path", "old_text", "new_text"]
+            }),
+        },
+        // NEW in v2: TodoWrite
+        Tool {
+            name: "TodoWrite".to_string(),
+            description: "Update the task list. Use to plan and track progress.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "Complete list of tasks (replaces existing)",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "Task description"
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Task status"
+                                },
+                                "activeForm": {
+                                    "type": "string",
+                                    "description": "Present tense action, e.g. 'Reading files'"
+                                }
+                            },
+                            "required": ["content", "status", "activeForm"]
+                        }
+                    }
+                },
+                "required": ["items"]
             }),
         },
     ]
@@ -205,14 +391,9 @@ fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     &s[..boundary]
 }
 
-/// Ensure path stays within workspace (security measure).
-///
-/// Prevents the model from accessing files outside the project directory.
-/// Resolves relative paths and checks they don't escape via '../'.
 fn safe_path(workdir: &Path, relative_path: &str) -> Result<PathBuf> {
     let path = workdir.join(relative_path);
     let canonical = path.canonicalize().or_else(|_| {
-        // If file doesn't exist yet, check parent directory
         if let Some(parent) = path.parent() {
             if parent.exists() {
                 Ok(parent.canonicalize()?.join(
@@ -234,13 +415,7 @@ fn safe_path(workdir: &Path, relative_path: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// Execute shell command with safety checks.
-///
-/// Security: Blocks obviously dangerous commands.
-/// Timeout: 60 seconds to prevent hanging.
-/// Output: Truncated to 50KB to prevent context overflow.
 fn run_bash(workdir: &Path, command: &str) -> String {
-    // Basic safety - block dangerous patterns
     let dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
     if dangerous.iter().any(|d| command.contains(d)) {
         return "Error: Dangerous command blocked".to_string();
@@ -260,23 +435,16 @@ fn run_bash(workdir: &Path, command: &str) -> String {
 
             if combined.is_empty() {
                 "(no output)".to_string()
+            } else if combined.len() > 50000 {
+                format!("{}...", safe_truncate(&combined, 50000))
             } else {
-                // Truncate to 50KB
-                if combined.len() > 50000 {
-                    format!("{}...", safe_truncate(&combined, 50000))
-                } else {
-                    combined
-                }
+                combined
             }
         }
         Err(e) => format!("Error: {}", e),
     }
 }
 
-/// Read file contents with optional line limit.
-///
-/// For large files, use limit to read just the first N lines.
-/// Output truncated to 50KB to prevent context overflow.
 fn run_read(workdir: &Path, path: &str, limit: Option<i64>) -> String {
     match safe_path(workdir, path) {
         Ok(safe_path) => match fs::read_to_string(&safe_path) {
@@ -300,7 +468,6 @@ fn run_read(workdir: &Path, path: &str, limit: Option<i64>) -> String {
                     content
                 };
 
-                // Truncate to 50KB
                 if output.len() > 50000 {
                     format!("{}...", safe_truncate(&output, 50000))
                 } else {
@@ -313,10 +480,6 @@ fn run_read(workdir: &Path, path: &str, limit: Option<i64>) -> String {
     }
 }
 
-/// Write content to file, creating parent directories if needed.
-///
-/// This is for complete file creation/overwrite.
-/// For partial edits, use edit_file instead.
 fn run_write(workdir: &Path, path: &str, content: &str) -> String {
     match safe_path(workdir, path) {
         Ok(safe_path) => {
@@ -335,10 +498,6 @@ fn run_write(workdir: &Path, path: &str, content: &str) -> String {
     }
 }
 
-/// Replace exact text in a file (surgical edit).
-///
-/// Uses exact string matching - the old_text must appear verbatim.
-/// Only replaces the first occurrence to prevent accidental mass changes.
 fn run_edit(workdir: &Path, path: &str, old_text: &str, new_text: &str) -> String {
     match safe_path(workdir, path) {
         Ok(safe_path) => match fs::read_to_string(&safe_path) {
@@ -347,7 +506,6 @@ fn run_edit(workdir: &Path, path: &str, old_text: &str, new_text: &str) -> Strin
                     return format!("Error: Text not found in {}", path);
                 }
 
-                // Replace only first occurrence for safety
                 let new_content = content.replacen(old_text, new_text, 1);
 
                 match fs::write(&safe_path, new_content) {
@@ -361,11 +519,19 @@ fn run_edit(workdir: &Path, path: &str, old_text: &str, new_text: &str) -> Strin
     }
 }
 
-/// Dispatch tool call to the appropriate implementation.
-///
-/// This is the bridge between the model's tool calls and actual execution.
-/// Each tool returns a string result that goes back to the model.
-fn execute_tool(workdir: &Path, name: &str, input: &serde_json::Value) -> String {
+fn run_todo(todo_manager: &TodoManager, items: Vec<TodoItem>) -> String {
+    match todo_manager.update(items) {
+        Ok(rendered) => rendered,
+        Err(e) => format!("Error: {}", e),
+    }
+}
+
+fn execute_tool(
+    workdir: &Path,
+    todo_manager: &TodoManager,
+    name: &str,
+    input: &serde_json::Value,
+) -> String {
     match name {
         "bash" => {
             if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
@@ -408,37 +574,34 @@ fn execute_tool(workdir: &Path, name: &str, input: &serde_json::Value) -> String
                 "Error: Missing 'path' parameter".to_string()
             }
         }
+        "TodoWrite" => {
+            if let Some(items_value) = input.get("items") {
+                match serde_json::from_value::<Vec<TodoItem>>(items_value.clone()) {
+                    Ok(items) => run_todo(todo_manager, items),
+                    Err(e) => format!("Error parsing todo items: {}", e),
+                }
+            } else {
+                "Error: Missing 'items' parameter".to_string()
+            }
+        }
         _ => format!("Unknown tool: {}", name),
     }
 }
 
 // =============================================================================
-// The Agent Loop - This is the CORE of everything
+// Agent Loop (with todo tracking)
 // =============================================================================
 
-/// The complete agent in one function.
-///
-/// This is the pattern that ALL coding agents share:
-///
-///     while True:
-///         response = model(messages, tools)
-///         if no tool calls: return
-///         execute tools, append results, continue
-///
-/// The model controls the loop:
-///   - Keeps calling tools until stop_reason != "tool_use"
-///   - Results become context (fed back as "user" messages)
-///   - Memory is automatic (messages list accumulates history)
-///
-/// Why this works:
-///   1. Model decides which tools, in what order, when to stop
-///   2. Tool results provide feedback for next decision
-///   3. Conversation history maintains context across turns
-async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message>) -> Result<()> {
+async fn agent_loop(
+    client: &Client,
+    config: &Config,
+    todo_manager: &TodoManager,
+    messages: &mut Vec<Message>,
+    rounds_without_todo: &mut usize,
+) -> Result<()> {
     let tools = create_tools();
 
     loop {
-        // Step 1: Call the model
         let request = MessagesRequestBuilder::new(&config.model, messages.clone(), 8000)
             .system(SystemPrompt::Text(config.system_prompt()))
             .tools(tools.clone())
@@ -517,7 +680,6 @@ async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message
             }
         };
 
-        // Step 2: Collect any tool calls and print text output
         let mut tool_calls = Vec::new();
         for block in &response.content {
             match block {
@@ -533,7 +695,6 @@ async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message
             }
         }
 
-        // Step 3: If no tool calls, task is complete
         if response.stop_reason != Some(StopReason::ToolUse) {
             messages.push(Message {
                 role: Role::Assistant,
@@ -542,37 +703,56 @@ async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message
             return Ok(());
         }
 
-        // Step 4: Execute each tool and collect results
         let mut results = Vec::new();
-        for (id, name, input) in tool_calls {
-            // Display what's being executed
-            println!(
-                "\n{} {}: {:?}",
-                ">".bright_blue(),
-                name.bright_yellow(),
-                input
-            );
+        let mut used_todo = false;
 
-            // Execute and show result preview
-            let output = execute_tool(&config.workdir, &name, &input);
-            let preview = if output.len() > 200 {
-                format!("{}...", safe_truncate(&output, 200))
+        for (id, name, input) in tool_calls {
+            // Display tool call with different colors for different tools
+            let tool_display = match name.as_str() {
+                "TodoWrite" => format!("{} {}", ">".bright_blue(), name.bright_magenta()),
+                "bash" => format!("{} {}", ">".bright_blue(), name.bright_yellow()),
+                _ => format!("{} {}", ">".bright_blue(), name.bright_cyan()),
+            };
+            println!("\n{}", tool_display);
+
+            let output = execute_tool(&config.workdir, todo_manager, &name, &input);
+
+            // For TodoWrite, show full output; for others, truncate
+            let preview = if name == "TodoWrite" {
+                output.clone()
+            } else if output.len() > 300 {
+                format!("{}...", safe_truncate(&output, 300))
             } else {
                 output.clone()
             };
-            println!("  {}", preview.bright_black());
 
-            // Collect result for the model
+            // Color the output based on success/error
+            if output.starts_with("Error:") {
+                println!("{}", preview.bright_red());
+            } else if name == "TodoWrite" {
+                println!("{}", preview.bright_green());
+            } else {
+                println!("  {}", preview.bright_black());
+            }
+
             results.push(ContentBlock::ToolResult {
                 tool_use_id: id,
                 is_error: None,
                 content: anthropic::types::ToolResultContent::Text(output),
             });
+
+            if name == "TodoWrite" {
+                used_todo = true;
+            }
         }
 
-        // Step 5: Append to conversation and continue
-        // Note: We append assistant's response, then user's tool results
-        // This maintains the alternating user/assistant pattern
+        // Update counter
+        if used_todo {
+            *rounds_without_todo = 0;
+        } else {
+            *rounds_without_todo += 1;
+        }
+
         messages.push(Message {
             role: Role::Assistant,
             content: response.content,
@@ -621,35 +801,119 @@ fn create_client() -> Result<Client> {
 }
 
 // =============================================================================
+// Input handling
+// =============================================================================
+
+#[cfg(not(feature = "readline"))]
+fn prompt_user() -> Result<String> {
+    print!("{} ", "You:".bright_cyan());
+    io::stdout().flush()?;
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .context("Failed to read from stdin")?;
+
+    Ok(line.trim().to_string())
+}
+
+#[cfg(feature = "readline")]
+fn prompt_user_with_rl(editor: &mut Editor<(), DefaultHistory>) -> Result<String> {
+    let readline = editor.readline(&format!("{} ", "You:".bright_cyan()));
+
+    match readline {
+        Ok(line) => {
+            let _ = editor.add_history_entry(&line);
+            Ok(line.trim().to_string())
+        }
+        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => Ok("exit".to_string()),
+        Err(err) => Err(anyhow::anyhow!("Readline error: {}", err)),
+    }
+}
+
+// =============================================================================
 // Main REPL
 // =============================================================================
 
-/// Simple Read-Eval-Print Loop for interactive use.
-///
-/// The history list maintains conversation context across turns,
-/// allowing multi-turn conversations with memory.
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
-
-    // Initialize client - from_env() handles both API_KEY and BASE_URL
     let client = create_client()?;
+    let todo_manager = TodoManager::new();
 
     println!(
         "{}",
-        format!("Mini Claude Code v1 - {}", config.workdir.display()).bright_green()
+        format!(
+            "Mini Claude Code v2 (with Todos) - {}",
+            config.workdir.display()
+        )
+        .bright_green()
     );
     println!("{}\n", "Type 'exit' to quit.".bright_black());
 
     let mut history: Vec<Message> = Vec::new();
+    let mut first_message = true;
+    let mut rounds_without_todo = 0;
+
+    #[cfg(feature = "readline")]
+    let mut rl = Editor::<(), DefaultHistory>::new()?;
+
+    // Reminder messages - More detailed and actionable
+    let initial_reminder = r#"<system-reminder>
+For multi-step tasks, use the TodoWrite tool to track progress:
+
+Example TodoWrite structure:
+{
+  "items": [
+    {
+      "content": "Read and analyze codebase structure",
+      "status": "in_progress",
+      "activeForm": "Analyzing codebase structure"
+    },
+    {
+      "content": "Identify key components and patterns",
+      "status": "pending",
+      "activeForm": "Identifying components"
+    },
+    {
+      "content": "Write analysis report",
+      "status": "pending",
+      "activeForm": "Writing report"
+    }
+  ]
+}
+
+Benefits:
+- Visible plan for both you and me
+- Track what's done and what's next
+- Stay focused on one task at a time (only one "in_progress")
+- Maximum 20 tasks to keep plans manageable
+</system-reminder>"#;
+
+    let nag_reminder = r#"<system-reminder>
+It's been 10+ tool calls without updating the todo list.
+
+Please update the TodoWrite to:
+1. Mark completed tasks as "completed"
+2. Update current task to "in_progress" with activeForm
+3. Add any new tasks discovered during work
+
+This helps maintain visibility and focus.
+</system-reminder>"#;
 
     loop {
-        print!("{} ", "You:".bright_cyan());
-        io::stdout().flush()?;
-
-        let mut user_input = String::new();
-        io::stdin().read_line(&mut user_input)?;
-        let user_input = user_input.trim();
+        let user_input = {
+            #[cfg(feature = "readline")]
+            {
+                prompt_user_with_rl(&mut rl)?
+            }
+            #[cfg(not(feature = "readline"))]
+            {
+                prompt_user()?
+            }
+        };
 
         if user_input.is_empty()
             || matches!(user_input.to_lowercase().as_str(), "exit" | "quit" | "q")
@@ -657,18 +921,36 @@ async fn main() -> Result<()> {
             break;
         }
 
-        // Add user message to history
+        // Build user message with optional reminders
+        let mut content = Vec::new();
+
+        if first_message {
+            content.push(ContentBlock::text(initial_reminder));
+            first_message = false;
+        } else if rounds_without_todo > 10 {
+            content.push(ContentBlock::text(nag_reminder));
+        }
+
+        content.push(ContentBlock::text(user_input));
+
         history.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::text(user_input)],
+            content,
         });
 
-        // Run the agent loop
-        if let Err(e) = agent_loop(&client, &config, &mut history).await {
+        if let Err(e) = agent_loop(
+            &client,
+            &config,
+            &todo_manager,
+            &mut history,
+            &mut rounds_without_todo,
+        )
+        .await
+        {
             eprintln!("{}: {}", "Error".bright_red(), e);
         }
 
-        println!(); // Blank line between turns
+        println!();
     }
 
     Ok(())

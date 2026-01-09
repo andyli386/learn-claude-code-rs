@@ -8,9 +8,28 @@ use anthropic::types::{
 };
 use anthropic::Client;
 use anyhow::Result;
+use colored::Colorize;
 use serde_json::json;
 use std::env;
 use std::process::{Command, Stdio};
+
+/// Safely truncate a string at a UTF-8 character boundary.
+///
+/// Unlike `&s[..n]` which panics if n is not at a character boundary,
+/// this function finds the largest valid boundary <= max_bytes.
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+
+    // Find the last character boundary at or before max_bytes
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+
+    &s[..boundary]
+}
 
 /// Get current working directory
 pub fn get_cwd() -> String {
@@ -119,7 +138,62 @@ pub async fn chat(
             .tools(tools.clone())
             .build()?;
 
-        let response = client.messages(request).await?;
+        // Wrap API call with explicit timeout
+        let api_call = client.messages(request);
+        let timeout_duration = std::time::Duration::from_secs(60);
+
+        let response = match tokio::time::timeout(timeout_duration, api_call).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                // Display user-friendly error message
+                eprintln!("\n{}: {}", "API Error".bright_red(), e);
+
+                // Check for common errors and provide helpful messages
+                let error_msg = e.to_string();
+                if error_msg.contains("余额不足") || error_msg.contains("insufficient") {
+                    eprintln!(
+                        "{}",
+                        "Hint: Your API account balance is insufficient. Please recharge."
+                            .bright_yellow()
+                    );
+                } else if error_msg.contains("unauthorized") || error_msg.contains("401") {
+                    eprintln!(
+                        "{}",
+                        "Hint: API key may be invalid. Check your ANTHROPIC_API_KEY."
+                            .bright_yellow()
+                    );
+                } else if error_msg.contains("timeout") {
+                    eprintln!(
+                        "{}",
+                        "Hint: Request timed out. The API server may be slow or unreachable."
+                            .bright_yellow()
+                    );
+                } else if error_msg.contains("connection") {
+                    eprintln!(
+                        "{}",
+                        "Hint: Network connection error. Check your internet connection."
+                            .bright_yellow()
+                    );
+                }
+
+                return Err(e.into());
+            }
+            Err(_) => {
+                // Timeout occurred
+                eprintln!(
+                    "\n{}: {}",
+                    "API Error".bright_red(),
+                    "Request timed out after 60 seconds"
+                );
+                eprintln!(
+                    "{}",
+                    "Hint: Request timed out. The API server may be slow or unreachable."
+                        .bright_yellow()
+                );
+
+                return Err(anyhow::anyhow!("Request timed out after 60 seconds"));
+            }
+        };
 
         // 2. Build assistant message content (preserve both text and tool_use blocks)
         let mut assistant_content = vec![];
@@ -157,7 +231,7 @@ pub async fn chat(
                     // Execute command with timeout
                     let output = execute_bash(command);
                     let truncated_output = if output.len() > 50000 {
-                        format!("{}... (truncated)", &output[..50000])
+                        format!("{}... (truncated)", safe_truncate(&output, 50000))
                     } else {
                         output
                     };

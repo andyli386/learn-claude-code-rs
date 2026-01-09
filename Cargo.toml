@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace]
-members = ["crates/v0_bash_agent", "crates/v1_basic_agent"]
+members = ["crates/v0_bash_agent", "crates/v1_basic_agent", "crates/v2_todo_agent"]
 resolver = "2"
 
 [workspace.dependencies]

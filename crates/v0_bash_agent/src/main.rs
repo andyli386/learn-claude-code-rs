@@ -77,6 +77,9 @@ fn create_client() -> Result<Client> {
         builder = builder.api_version(api_version);
     }
 
+    // Set timeout to 60 seconds to prevent indefinite hanging
+    builder = builder.timeout(std::time::Duration::from_secs(60));
+
     let client = builder.build()?;
     Ok(client)
 }
