@@ -138,9 +138,9 @@ pub async fn chat(
             .tools(tools.clone())
             .build()?;
 
-        // Wrap API call with explicit timeout
+        // Wrap API call with explicit timeout (10 minutes)
         let api_call = client.messages(request);
-        let timeout_duration = std::time::Duration::from_secs(60);
+        let timeout_duration = std::time::Duration::from_secs(600);
 
         let response = match tokio::time::timeout(timeout_duration, api_call).await {
             Ok(Ok(resp)) => resp,
@@ -183,15 +183,15 @@ pub async fn chat(
                 eprintln!(
                     "\n{}: {}",
                     "API Error".bright_red(),
-                    "Request timed out after 60 seconds"
+                    "Request timed out after 10 minutes"
                 );
                 eprintln!(
                     "{}",
-                    "Hint: Request timed out. The API server may be slow or unreachable."
+                    "Hint: Request timed out. The task may be too complex or the API server is slow."
                         .bright_yellow()
                 );
 
-                return Err(anyhow::anyhow!("Request timed out after 60 seconds"));
+                return Err(anyhow::anyhow!("Request timed out after 10 minutes"));
             }
         };
 

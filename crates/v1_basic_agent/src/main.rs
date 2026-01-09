@@ -448,9 +448,9 @@ async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message
         print!("{}", "Thinking...".bright_black());
         io::stdout().flush().ok();
 
-        // Wrap API call with explicit timeout
+        // Wrap API call with explicit timeout (10 minutes)
         let api_call = client.messages(request);
-        let timeout_duration = std::time::Duration::from_secs(60);
+        let timeout_duration = std::time::Duration::from_secs(600);
 
         let response = match tokio::time::timeout(timeout_duration, api_call).await {
             Ok(Ok(resp)) => {
@@ -505,15 +505,15 @@ async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message
                 eprintln!(
                     "\n{}: {}",
                     "API Error".bright_red(),
-                    "Request timed out after 60 seconds"
+                    "Request timed out after 10 minutes"
                 );
                 eprintln!(
                     "{}",
-                    "Hint: Request timed out. The API server may be slow or unreachable."
+                    "Hint: Request timed out. The task may be too complex or the API server is slow."
                         .bright_yellow()
                 );
 
-                return Err(anyhow::anyhow!("Request timed out after 60 seconds"));
+                return Err(anyhow::anyhow!("Request timed out after 10 minutes"));
             }
         };
 
@@ -613,8 +613,9 @@ fn create_client() -> Result<Client> {
         builder = builder.api_version(api_version);
     }
 
-    // Set timeout to 60 seconds to prevent indefinite hanging
-    builder = builder.timeout(std::time::Duration::from_secs(60));
+    // Set timeout to 10 minutes to allow for complex code generation
+    // while still preventing indefinite hanging
+    builder = builder.timeout(std::time::Duration::from_secs(600));
 
     let client = builder.build()?;
     Ok(client)
@@ -672,4 +673,115 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_safe_truncate_short_string() {
+        let s = "Hello, World!";
+        assert_eq!(safe_truncate(s, 100), "Hello, World!");
+    }
+
+    #[test]
+    fn test_safe_truncate_ascii() {
+        let s = "Hello, World! This is a test.";
+        let truncated = safe_truncate(s, 13);
+        assert_eq!(truncated, "Hello, World!");
+    }
+
+    #[test]
+    fn test_safe_truncate_utf8() {
+        // Chinese characters are 3 bytes each
+        let s = "你好世界abc"; // 你好世界 = 12 bytes, a = 1 byte
+        let truncated = safe_truncate(s, 13);
+        // Should truncate to "你好世界a" (13 bytes), including the 'a'
+        assert_eq!(truncated, "你好世界a");
+        assert!(truncated.len() <= 13);
+
+        // Test mid-character truncation: byte 13 would be in middle of 'b'
+        let s2 = "你好世界😀"; // 你好世界 = 12 bytes, 😀 = 4 bytes (total 16)
+        let truncated2 = safe_truncate(s2, 13);
+        // Should truncate to just "你好世界" (12 bytes), not split the emoji
+        assert_eq!(truncated2, "你好世界");
+        assert!(truncated2.len() <= 13);
+    }
+
+    #[test]
+    fn test_safe_truncate_emoji() {
+        // Emoji are 4 bytes each
+        let s = "😀😁😂abc";
+        let truncated = safe_truncate(s, 9);
+        // Should truncate to "😀😁" (8 bytes), not split into the third emoji
+        assert_eq!(truncated, "😀😁");
+    }
+
+    #[test]
+    fn test_safe_truncate_exact_boundary() {
+        let s = "Hello";
+        assert_eq!(safe_truncate(s, 5), "Hello");
+    }
+
+    #[test]
+    fn test_create_tools_count() {
+        let tools = create_tools();
+        assert_eq!(tools.len(), 4, "Should have 4 tools");
+    }
+
+    #[test]
+    fn test_create_tools_names() {
+        let tools = create_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"edit_file"));
+    }
+
+    #[test]
+    fn test_config_system_prompt() {
+        let config = Config {
+            model: "test-model".to_string(),
+            workdir: PathBuf::from("/test/path"),
+        };
+        let prompt = config.system_prompt();
+        assert!(prompt.contains("/test/path"));
+        assert!(prompt.contains("coding agent"));
+    }
+
+    #[test]
+    fn test_safe_path_valid() {
+        let workdir = std::env::temp_dir();
+        let result = safe_path(&workdir, "test.txt");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_safe_path_escape_attempt() {
+        let workdir = std::env::temp_dir();
+        // Try to escape with ../../../etc/passwd
+        let result = safe_path(&workdir, "../../../etc/passwd");
+        // Should fail because it escapes the workspace
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_run_bash_simple() {
+        let workdir = std::env::current_dir().unwrap();
+        let output = run_bash(&workdir, "echo 'test'");
+        assert!(output.contains("test"));
+    }
+
+    #[test]
+    fn test_run_bash_dangerous_blocked() {
+        let workdir = std::env::current_dir().unwrap();
+        let output = run_bash(&workdir, "rm -rf /");
+        assert!(output.contains("Dangerous command blocked"));
+    }
 }
