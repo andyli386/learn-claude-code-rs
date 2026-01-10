@@ -1,4 +1,5 @@
 [default.extend-words]
+wrk = "wrk"  # HTTP benchmarking tool
 
 [files]
 extend-exclude = ["CHANGELOG.md", "notebooks/*"]

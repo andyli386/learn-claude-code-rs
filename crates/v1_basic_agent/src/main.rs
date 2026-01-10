@@ -55,6 +55,62 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+// =============================================================================
+// Thinking Animation
+// =============================================================================
+
+/// Spawn a thinking animation in a background thread
+/// Returns a handle that stops the animation when dropped
+fn spawn_thinking_animation() -> ThinkingAnimation {
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+
+    let handle = thread::spawn(move || {
+        let frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut idx = 0;
+
+        // Hide cursor
+        print!("\x1B[?25l");
+        io::stdout().flush().ok();
+
+        while running_clone.load(Ordering::Relaxed) {
+            let frame = frames[idx % frames.len()];
+            print!("\r{} {}...", frame.bright_cyan(), "Thinking".bright_black());
+            io::stdout().flush().ok();
+
+            thread::sleep(Duration::from_millis(80));
+            idx += 1;
+        }
+
+        // Clear the line and show cursor
+        print!("\r\x1B[K\x1B[?25h");
+        io::stdout().flush().ok();
+    });
+
+    ThinkingAnimation {
+        running,
+        handle: Some(handle),
+    }
+}
+
+struct ThinkingAnimation {
+    running: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ThinkingAnimation {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.join().ok();
+        }
+    }
+}
 
 // =============================================================================
 // Configuration
@@ -444,25 +500,20 @@ async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message
             .tools(tools.clone())
             .build()?;
 
-        // Show "thinking" indicator
-        print!("{}", "Thinking...".bright_black());
-        io::stdout().flush().ok();
+        // Record start time
+        let start = Instant::now();
+
+        // Start thinking animation
+        let _animation = spawn_thinking_animation();
 
         // Wrap API call with explicit timeout (10 minutes)
         let api_call = client.messages(request);
         let timeout_duration = std::time::Duration::from_secs(600);
 
         let response = match tokio::time::timeout(timeout_duration, api_call).await {
-            Ok(Ok(resp)) => {
-                // Clear "thinking" indicator
-                print!("\r{}\r", " ".repeat(20));
-                io::stdout().flush().ok();
-                resp
-            }
+            Ok(Ok(resp)) => resp,
             Ok(Err(e)) => {
-                // Clear "thinking" indicator
-                print!("\r{}\r", " ".repeat(20));
-                io::stdout().flush().ok();
+                // Animation stops automatically when _animation is dropped
 
                 // Display user-friendly error message
                 eprintln!("\n{}: {}", "API Error".bright_red(), e);
@@ -498,10 +549,8 @@ async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message
                 return Err(e.into());
             }
             Err(_) => {
+                // Animation stops automatically when _animation is dropped
                 // Timeout occurred
-                print!("\r{}\r", " ".repeat(20));
-                io::stdout().flush().ok();
-
                 eprintln!(
                     "\n{}: {}",
                     "API Error".bright_red(),
@@ -516,6 +565,24 @@ async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message
                 return Err(anyhow::anyhow!("Request timed out after 10 minutes"));
             }
         };
+
+        // Calculate elapsed time
+        let elapsed = start.elapsed();
+
+        // Animation is dropped here, which clears the line
+        drop(_animation);
+
+        // Display token usage and timing - on a fresh line after animation clears
+        let usage = &response.usage;
+        let elapsed_secs = elapsed.as_secs_f64();
+        println!(
+            "{}",
+            format!(
+                "in: {} out: {} {:.1}s",
+                usage.input_tokens, usage.output_tokens, elapsed_secs
+            )
+            .bright_black()
+        );
 
         // Step 2: Collect any tool calls and print text output
         let mut tool_calls = Vec::new();
