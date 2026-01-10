@@ -5,7 +5,11 @@ edition = "2021"
 license = "MIT"
 
 [workspace]
-members = ["crates/v0_bash_agent", "crates/v1_basic_agent", "crates/v2_todo_agent"]
+members = [
+    "crates/v0_bash_agent",
+    "crates/v1_basic_agent",
+    "crates/v2_todo_agent",
+]
 resolver = "2"
 
 [workspace.dependencies]
@@ -16,4 +20,5 @@ serde_json = "1"
 dotenvy = "0.15"
 anyhow = "1"
 colored = "3"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13.1", features = ["json"] }
+rustyline = { version = "17.0.2" }

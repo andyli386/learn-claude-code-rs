@@ -21,4 +21,4 @@ anyhow = { workspace = true }
 colored = { workspace = true }
 
 # Optional: for better UTF-8 input handling
-rustyline = { version = "14", optional = true }
+rustyline = { workspace = true, optional = true }
