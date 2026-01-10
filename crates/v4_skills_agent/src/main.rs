@@ -1,55 +1,78 @@
-//! v3_subagent - Mini Claude Code: Subagent Mechanism (~900 lines)
+//! v4_skills_agent - Mini Claude Code: Skills Mechanism (~1500 lines)
 //!
-//! Core Philosophy: "Divide and Conquer with Context Isolation"
-//! =============================================================
-//! v2 adds planning. But for large tasks like "explore the codebase then
-//! refactor auth", a single agent hits problems:
+//! Core Philosophy: "Knowledge Externalization"
+//! ============================================
+//! v3 gave us subagents for task decomposition. But there's a deeper question:
 //!
-//! The Problem - Context Pollution:
-//! -------------------------------
-//!     Single-Agent History:
-//!       [exploring...] cat file1.rs -> 500 lines
-//!       [exploring...] cat file2.rs -> 300 lines
-//!       ... 15 more files ...
-//!       [now refactoring...] "Wait, what did file1 contain?"
+//!     How does the model know HOW to handle domain-specific tasks?
 //!
-//! The model's context fills with exploration details, leaving little room
-//! for the actual task. This is "context pollution".
+//! - Processing PDFs? It needs to know pdftotext vs PyMuPDF
+//! - Building MCP servers? It needs protocol specs and best practices
+//! - Code review? It needs a systematic checklist
 //!
-//! The Solution - Subagents with Isolated Context:
-//! ----------------------------------------------
-//!     Main Agent History:
-//!       [Task: explore codebase]
-//!         -> Subagent explores 20 files (in its own context)
-//!         -> Returns ONLY: "Auth in src/auth/, DB in src/models/"
-//!       [now refactoring with clean context]
+//! This knowledge isn't a tool - it's EXPERTISE. Skills solve this by letting
+//! the model load domain knowledge on-demand.
 //!
-//! Each subagent has:
-//!   1. Its own fresh message history
-//!   2. Filtered tools (explore can't write)
-//!   3. Specialized system prompt
-//!   4. Returns only final summary to parent
+//! The Paradigm Shift: Knowledge Externalization
+//! ---------------------------------------------
+//! Traditional AI: Knowledge locked in model parameters
+//!   - To teach new skills: collect data -> train -> deploy
+//!   - Cost: $10K-$1M+, Timeline: Weeks
+//!   - Requires ML expertise, GPU clusters
 //!
-//! The Key Insight:
-//! ---------------
-//!     Process isolation = Context isolation
+//! Skills: Knowledge stored in editable files
+//!   - To teach new skills: write a SKILL.md file
+//!   - Cost: Free, Timeline: Minutes
+//!   - Anyone can do it
 //!
-//! By spawning subtasks, we get:
-//!   - Clean context for the main agent
-//!   - Parallel exploration possible
-//!   - Natural task decomposition
-//!   - Same agent loop, different contexts
+//! It's like attaching a hot-swappable LoRA adapter without any training!
 //!
-//! Agent Type Registry:
-//! -------------------
-//!     | Type    | Tools               | Purpose                     |
-//!     |---------|---------------------|---------------------------- |
-//!     | explore | bash, read_file     | Read-only exploration       |
-//!     | code    | all tools           | Full implementation access  |
-//!     | plan    | bash, read_file     | Design without modifying    |
+//! Tools vs Skills:
+//! ----------------
+//!     | Concept   | What it is              | Example                    |
+//!     |-----------|-------------------------|----------------------------|
+//!     | **Tool**  | What model CAN do       | bash, read_file, write     |
+//!     | **Skill** | How model KNOWS to do   | PDF processing, MCP dev    |
+//!
+//! Tools are capabilities. Skills are knowledge.
+//!
+//! Progressive Disclosure:
+//! -----------------------
+//!     Layer 1: Metadata (always loaded)      ~100 tokens/skill
+//!              name + description only
+//!
+//!     Layer 2: SKILL.md body (on trigger)    ~2000 tokens
+//!              Detailed instructions
+//!
+//!     Layer 3: Resources (as needed)         Unlimited
+//!              scripts/, references/, assets/
+//!
+//! This keeps context lean while allowing arbitrary depth.
+//!
+//! SKILL.md Standard:
+//! ------------------
+//!     skills/
+//!     |-- pdf/
+//!     |   |-- SKILL.md          # Required: YAML frontmatter + Markdown body
+//!     |-- mcp-builder/
+//!     |   |-- SKILL.md
+//!     |   |-- references/       # Optional: docs, specs
+//!     |-- code-review/
+//!         |-- SKILL.md
+//!         |-- scripts/          # Optional: helper scripts
+//!
+//! Cache-Preserving Injection:
+//! ---------------------------
+//! Critical insight: Skill content goes into tool_result (user message),
+//! NOT system prompt. This preserves prompt cache!
+//!
+//!     Wrong: Edit system prompt each time (cache invalidated, 20-50x cost)
+//!     Right: Append skill as tool result (prefix unchanged, cache hit)
+//!
+//! This is how production Claude Code works - and why it's cost-efficient.
 //!
 //! Usage:
-//!     cargo run -p v3_subagent
+//!     cargo run -p v4_skills_agent
 
 use anthropic::types::{
     ContentBlock, Message, MessagesRequestBuilder, Role, StopReason, SystemPrompt, Tool,
@@ -57,6 +80,7 @@ use anthropic::types::{
 use anthropic::Client;
 use anyhow::{Context, Result};
 use colored::Colorize;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -81,11 +105,9 @@ use rustyline::history::DefaultHistory;
 use rustyline::Editor;
 
 // =============================================================================
-// Thinking Animation (from v2, unchanged)
+// Thinking Animation (from v2/v3)
 // =============================================================================
 
-/// Spawn a thinking animation in a background thread
-/// Returns a handle that stops the animation when dropped
 fn spawn_thinking_animation() -> ThinkingAnimation {
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
@@ -94,7 +116,6 @@ fn spawn_thinking_animation() -> ThinkingAnimation {
         let frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let mut idx = 0;
 
-        // Hide cursor
         print!("\x1B[?25l");
         io::stdout().flush().ok();
 
@@ -107,7 +128,6 @@ fn spawn_thinking_animation() -> ThinkingAnimation {
             idx += 1;
         }
 
-        // Clear the line and show cursor
         print!("\r\x1B[K\x1B[?25h");
         io::stdout().flush().ok();
     });
@@ -139,6 +159,7 @@ impl Drop for ThinkingAnimation {
 struct Config {
     model: String,
     workdir: PathBuf,
+    skills_dir: PathBuf,
     max_output_tokens: u32,
     max_truncation_retries: usize,
 }
@@ -150,61 +171,246 @@ impl Config {
         let model =
             env::var("MODEL_NAME").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
         let workdir = env::current_dir().context("Failed to get current directory")?;
+        let skills_dir = workdir.join("skills");
 
-        // Read MINI_CODE_MAX_OUTPUT_TOKENS from environment, default to 160000
         let max_output_tokens = env::var("MINI_CODE_MAX_OUTPUT_TOKENS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(160000)
-            .clamp(1000, 100_000_000); // Clamp between 1000 and 100M tokens
+            .clamp(1000, 100_000_000);
 
-        // Read max truncation retries, default to 3
         let max_truncation_retries = env::var("MINI_CODE_MAX_TRUNCATION_RETRIES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(3)
-            .clamp(1, 10); // Clamp between 1 and 10 retries
+            .clamp(1, 10);
 
         Ok(Self {
             model,
             workdir,
+            skills_dir,
             max_output_tokens,
             max_truncation_retries,
         })
     }
 
-    fn system_prompt(&self) -> String {
+    fn system_prompt(&self, skill_descriptions: &str, agent_descriptions: &str) -> String {
         format!(
             r#"You are a coding agent at {}.
 
 Loop: plan -> act with tools -> report.
 
-You can spawn subagents for complex subtasks:
+**Skills available** (invoke with Skill tool when task matches):
+{}
+
+**Subagents available** (invoke with Task tool for focused subtasks):
 {}
 
 Rules:
-- Use Task tool for subtasks that need focused exploration or implementation
+- Use Skill tool IMMEDIATELY when a task matches a skill description
+- Use Task tool for subtasks needing focused exploration or implementation
 - Use TodoWrite to track multi-step work
 - Prefer tools over prose. Act, don't just explain.
 - After finishing, summarize what changed."#,
             self.workdir.display(),
-            get_agent_descriptions()
+            skill_descriptions,
+            agent_descriptions
         )
     }
 }
 
 // =============================================================================
-// Agent Type Registry - The core of subagent mechanism
+// SkillLoader - The core addition in v4
+// =============================================================================
+
+#[derive(Debug, Clone)]
+struct Skill {
+    name: String,
+    description: String,
+    body: String,
+    dir: PathBuf,
+}
+
+/// Loads and manages skills from SKILL.md files.
+///
+/// A skill is a FOLDER containing:
+/// - SKILL.md (required): YAML frontmatter + markdown instructions
+/// - scripts/ (optional): Helper scripts the model can run
+/// - references/ (optional): Additional documentation
+/// - assets/ (optional): Templates, files for output
+///
+/// SKILL.md Format:
+/// ----------------
+///     ---
+///     name: pdf
+///     description: Process PDF files. Use when reading, creating, or merging PDFs.
+///     ---
+///
+///     # PDF Processing Skill
+///
+///     ## Reading PDFs
+///
+///     Use pdftotext for quick extraction:
+///     ```bash
+///     pdftotext input.pdf -
+///     ```
+///     ...
+///
+/// The YAML frontmatter provides metadata (name, description).
+/// The markdown body provides detailed instructions.
+struct SkillLoader {
+    skills: HashMap<String, Skill>,
+}
+
+impl SkillLoader {
+    fn new(skills_dir: &Path) -> Self {
+        let mut loader = Self {
+            skills: HashMap::new(),
+        };
+        loader.load_skills(skills_dir);
+        loader
+    }
+
+    /// Parse a SKILL.md file into metadata and body.
+    ///
+    /// Returns Some(Skill) if valid, None otherwise.
+    fn parse_skill_md(&self, path: &Path) -> Option<Skill> {
+        let content = fs::read_to_string(path).ok()?;
+
+        // Match YAML frontmatter between --- markers
+        let re = Regex::new(r"(?s)^---\s*\n(.*?)\n---\s*\n(.*)$").ok()?;
+        let caps = re.captures(&content)?;
+
+        let frontmatter = caps.get(1)?.as_str();
+        let body = caps.get(2)?.as_str();
+
+        // Parse YAML-like frontmatter (simple key: value)
+        let mut metadata = HashMap::new();
+        for line in frontmatter.lines() {
+            if let Some((key, value)) = line.split_once(':') {
+                let key = key.trim();
+                let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+                metadata.insert(key.to_string(), value.to_string());
+            }
+        }
+
+        // Require name and description
+        let name = metadata.get("name")?.clone();
+        let description = metadata.get("description")?.clone();
+
+        Some(Skill {
+            name,
+            description,
+            body: body.trim().to_string(),
+            dir: path.parent()?.to_path_buf(),
+        })
+    }
+
+    /// Scan skills directory and load all valid SKILL.md files.
+    ///
+    /// Only loads metadata at startup - body is already loaded but
+    /// only sent to model when Skill tool is invoked.
+    /// This keeps the initial system prompt lean.
+    fn load_skills(&mut self, skills_dir: &Path) {
+        if !skills_dir.exists() {
+            return;
+        }
+
+        if let Ok(entries) = fs::read_dir(skills_dir) {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+
+                let skill_md = entry.path().join("SKILL.md");
+                if !skill_md.exists() {
+                    continue;
+                }
+
+                if let Some(skill) = self.parse_skill_md(&skill_md) {
+                    self.skills.insert(skill.name.clone(), skill);
+                }
+            }
+        }
+    }
+
+    /// Generate skill descriptions for system prompt.
+    ///
+    /// This is Layer 1 - only name and description, ~100 tokens per skill.
+    /// Full content (Layer 2) is loaded only when Skill tool is called.
+    fn get_descriptions(&self) -> String {
+        if self.skills.is_empty() {
+            return "(no skills available)".to_string();
+        }
+
+        self.skills
+            .values()
+            .map(|skill| format!("- {}: {}", skill.name, skill.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Get full skill content for injection.
+    ///
+    /// This is Layer 2 - the complete SKILL.md body, plus any available
+    /// resources (Layer 3 hints).
+    ///
+    /// Returns None if skill not found.
+    fn get_skill_content(&self, name: &str) -> Option<String> {
+        let skill = self.skills.get(name)?;
+
+        let mut content = format!("# Skill: {}\n\n{}", skill.name, skill.body);
+
+        // List available resources (Layer 3 hints)
+        let mut resources = Vec::new();
+        for (folder, label) in [
+            ("scripts", "Scripts"),
+            ("references", "References"),
+            ("assets", "Assets"),
+        ] {
+            let folder_path = skill.dir.join(folder);
+            if folder_path.exists() {
+                if let Ok(entries) = fs::read_dir(&folder_path) {
+                    let files: Vec<_> = entries
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect();
+                    if !files.is_empty() {
+                        resources.push(format!("{}: {}", label, files.join(", ")));
+                    }
+                }
+            }
+        }
+
+        if !resources.is_empty() {
+            content.push_str(&format!(
+                "\n\n**Available resources in {}:**\n",
+                skill.dir.display()
+            ));
+            for r in resources {
+                content.push_str(&format!("- {}\n", r));
+            }
+        }
+
+        Some(content)
+    }
+
+    fn list_skills(&self) -> Vec<String> {
+        self.skills.keys().cloned().collect()
+    }
+}
+
+// =============================================================================
+// Agent Type Registry (from v3)
 // =============================================================================
 
 #[derive(Debug, Clone)]
 struct AgentConfig {
     description: String,
-    tools: Vec<String>, // Tool whitelist, or vec!["*"] for all
+    tools: Vec<String>,
     prompt: String,
 }
 
-/// Agent type registry
 fn get_agent_types() -> HashMap<String, AgentConfig> {
     let mut types = HashMap::new();
 
@@ -222,7 +428,7 @@ fn get_agent_types() -> HashMap<String, AgentConfig> {
         "code".to_string(),
         AgentConfig {
             description: "Full agent for implementing features and fixing bugs".to_string(),
-            tools: vec!["*".to_string()], // All tools
+            tools: vec!["*".to_string()],
             prompt: "You are a coding agent. Implement the requested changes efficiently."
                 .to_string(),
         },
@@ -240,7 +446,6 @@ fn get_agent_types() -> HashMap<String, AgentConfig> {
     types
 }
 
-/// Generate agent type descriptions for the Task tool
 fn get_agent_descriptions() -> String {
     let types = get_agent_types();
     types
@@ -251,7 +456,7 @@ fn get_agent_descriptions() -> String {
 }
 
 // =============================================================================
-// TodoManager (from v2, unchanged)
+// TodoManager (from v2)
 // =============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,7 +475,6 @@ enum TodoStatus {
     Completed,
 }
 
-/// Manages a structured task list with enforced constraints.
 struct TodoManager {
     items: Arc<Mutex<Vec<TodoItem>>>,
 }
@@ -282,11 +486,9 @@ impl TodoManager {
         }
     }
 
-    /// Validate and update the todo list.
     fn update(&self, new_items: Vec<TodoItem>) -> Result<String> {
         let mut in_progress_count = 0;
 
-        // Validate items
         for (i, item) in new_items.iter().enumerate() {
             if item.content.trim().is_empty() {
                 anyhow::bail!("Item {}: content required", i);
@@ -299,7 +501,6 @@ impl TodoManager {
             }
         }
 
-        // Enforce constraints
         if new_items.len() > 20 {
             anyhow::bail!("Max 20 todos allowed");
         }
@@ -307,13 +508,11 @@ impl TodoManager {
             anyhow::bail!("Only one task can be in_progress at a time");
         }
 
-        // Update stored items
         *self.items.lock().unwrap() = new_items;
 
         Ok(self.render())
     }
 
-    /// Render the todo list as human-readable text.
     fn render(&self) -> String {
         let items = self.items.lock().unwrap();
 
@@ -342,7 +541,7 @@ impl TodoManager {
 }
 
 // =============================================================================
-// Tool Definitions (v2 tools + Task)
+// Tool Definitions
 // =============================================================================
 
 fn create_base_tools() -> Vec<Tool> {
@@ -455,7 +654,7 @@ fn create_base_tools() -> Vec<Tool> {
     ]
 }
 
-/// Create the Task tool - NEW in v3
+/// Create the Task tool (from v3)
 fn create_task_tool() -> Tool {
     let agent_types = get_agent_types();
     let type_names: Vec<String> = agent_types.keys().cloned().collect();
@@ -464,9 +663,6 @@ fn create_task_tool() -> Tool {
         name: "Task".to_string(),
         description: format!(
             r#"Spawn a subagent for a focused subtask.
-
-Subagents run in ISOLATED context - they don't see parent's history.
-Use this to keep the main conversation clean.
 
 Agent types:
 {}
@@ -500,14 +696,48 @@ Example uses:
     }
 }
 
-/// Get all tools for main agent (includes Task)
-fn create_all_tools() -> Vec<Tool> {
+/// Create the Skill tool - NEW in v4
+fn create_skill_tool(skill_loader: &SkillLoader) -> Tool {
+    Tool {
+        name: "Skill".to_string(),
+        description: format!(
+            r#"Load a skill to gain specialized knowledge for a task.
+
+Available skills:
+{}
+
+When to use:
+- IMMEDIATELY when user task matches a skill description
+- Before attempting domain-specific work (PDF, MCP, etc.)
+
+The skill content will be injected into the conversation, giving you
+detailed instructions and access to resources."#,
+            skill_loader.get_descriptions()
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "skill": {
+                    "type": "string",
+                    "description": "Name of the skill to load"
+                }
+            },
+            "required": ["skill"]
+        }),
+    }
+}
+
+/// Get all tools for main agent (includes Task and Skill)
+fn create_all_tools(skill_loader: &SkillLoader) -> Vec<Tool> {
     let mut tools = create_base_tools();
     tools.push(create_task_tool());
+    tools.push(create_skill_tool(skill_loader));
     tools
 }
 
 /// Filter tools based on agent type
+/// Note: This does NOT include the Skill tool - that must be added separately
+/// by calling with skill_loader if needed
 fn get_tools_for_agent(agent_type: &str) -> Vec<Tool> {
     let agent_types = get_agent_types();
     let config = match agent_types.get(agent_type) {
@@ -517,23 +747,40 @@ fn get_tools_for_agent(agent_type: &str) -> Vec<Tool> {
 
     let base_tools = create_base_tools();
 
-    // If "*", return all base tools (but NOT Task to prevent recursion in this demo)
     if config.tools.contains(&"*".to_string()) {
         return base_tools;
     }
 
-    // Filter to allowed tools
     base_tools
         .into_iter()
         .filter(|t| config.tools.contains(&t.name))
         .collect()
 }
 
+/// Get tools for subagent, including Skill tool if agent type supports it
+fn get_tools_for_subagent(agent_type: &str, skill_loader: &SkillLoader) -> Vec<Tool> {
+    let mut tools = get_tools_for_agent(agent_type);
+
+    // Add Skill tool for agent types that can benefit from domain knowledge
+    // explore: read-only, can use skills for analysis patterns
+    // code: full access, can use skills for implementation guidance
+    // plan: read-only, can use skills for design patterns
+    match agent_type {
+        "explore" | "code" | "plan" => {
+            tools.push(create_skill_tool(skill_loader));
+        }
+        _ => {
+            // Other agent types don't get Skill tool
+        }
+    }
+
+    tools
+}
+
 // =============================================================================
-// Tool Implementations (from v2, unchanged)
+// Tool Implementations
 // =============================================================================
 
-/// Safely truncate a string at a UTF-8 character boundary.
 fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -682,11 +929,50 @@ fn run_todo(todo_manager: &TodoManager, items: Vec<TodoItem>) -> String {
     }
 }
 
+/// Load a skill and inject it into the conversation - NEW in v4
+///
+/// This is the key mechanism:
+/// 1. Get skill content (SKILL.md body + resource hints)
+/// 2. Return it wrapped in <skill-loaded> tags
+/// 3. Model receives this as tool_result (user message)
+/// 4. Model now "knows" how to do the task
+///
+/// Why tool_result instead of system prompt?
+/// - System prompt changes invalidate cache (20-50x cost increase)
+/// - Tool results append to end (prefix unchanged, cache hit)
+///
+/// This is how production systems stay cost-efficient.
+fn run_skill(skill_loader: &SkillLoader, skill_name: &str) -> String {
+    match skill_loader.get_skill_content(skill_name) {
+        Some(content) => {
+            format!(
+                r#"<skill-loaded name="{}">
+{}
+</skill-loaded>
+
+Follow the instructions in the skill above to complete the user's task."#,
+                skill_name, content
+            )
+        }
+        None => {
+            let available = skill_loader.list_skills().join(", ");
+            let available = if available.is_empty() {
+                "none".to_string()
+            } else {
+                available
+            };
+            format!(
+                "Error: Unknown skill '{}'. Available: {}",
+                skill_name, available
+            )
+        }
+    }
+}
+
 // =============================================================================
-// Subagent Progress Tracking
+// Subagent Progress Tracking (from v3)
 // =============================================================================
 
-/// Shared state for subagent progress display
 struct SubagentProgress {
     tool_count: usize,
     current_tool: Option<String>,
@@ -703,7 +989,6 @@ impl SubagentProgress {
     }
 }
 
-/// Spawn a background thread to update subagent progress display
 fn spawn_subagent_progress_updater(
     agent_type: String,
     description: String,
@@ -711,12 +996,11 @@ fn spawn_subagent_progress_updater(
     stop_signal: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        // Save cursor position after the main line
-        println!(); // Add a line for tool display
+        println!();
         io::stdout().flush().ok();
 
         while !stop_signal.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(1000)); // Update every second
+            thread::sleep(Duration::from_millis(1000));
 
             if stop_signal.load(Ordering::Relaxed) {
                 break;
@@ -728,7 +1012,6 @@ fn spawn_subagent_progress_updater(
             let current_tool = progress_guard.current_tool.clone();
             drop(progress_guard);
 
-            // Move cursor up 1 line, clear it, and redraw the status line
             println!(
                 "\x1B[1A\x1B[K  {} {} ... {} tools, {:.1}s",
                 format!("[{}]", agent_type).bright_magenta(),
@@ -737,7 +1020,6 @@ fn spawn_subagent_progress_updater(
                 elapsed
             );
 
-            // Draw the current tool line (or clear it if no tool)
             if let Some(tool_info) = current_tool {
                 println!(
                     "\x1B[K    {} {}",
@@ -748,7 +1030,6 @@ fn spawn_subagent_progress_updater(
                 println!("\x1B[K");
             }
 
-            // Move cursor back up to the tool line
             print!("\x1B[1A");
             io::stdout().flush().ok();
         }
@@ -756,22 +1037,14 @@ fn spawn_subagent_progress_updater(
 }
 
 // =============================================================================
-// Subagent Execution - The heart of v3
+// Subagent Execution (from v3, adapted for v4)
 // =============================================================================
 
-/// Execute a subagent task with isolated context.
-///
-/// This is the core of the subagent mechanism:
-///
-/// 1. Create isolated message history (KEY: no parent context!)
-/// 2. Use agent-specific system prompt
-/// 3. Filter available tools based on agent type
-/// 4. Run the same query loop as main agent
-/// 5. Return ONLY the final text (not intermediate details)
 async fn run_task(
     client: &Client,
     config: &Config,
     todo_manager: &TodoManager,
+    skill_loader: &SkillLoader,
     description: &str,
     prompt: &str,
     agent_type: &str,
@@ -782,7 +1055,6 @@ async fn run_task(
         None => return format!("Error: Unknown agent type '{}'", agent_type),
     };
 
-    // Agent-specific system prompt
     let sub_system = format!(
         r#"You are a {} subagent at {}.
 
@@ -794,29 +1066,25 @@ Complete the task and return a clear, concise summary."#,
         agent_config.prompt
     );
 
-    // Filtered tools for this agent type
-    let sub_tools = get_tools_for_agent(agent_type);
+    // Get tools including Skill tool for subagent
+    let sub_tools = get_tools_for_subagent(agent_type, skill_loader);
 
-    // ISOLATED message history - this is the key!
     let mut sub_messages = vec![Message {
         role: Role::User,
         content: vec![ContentBlock::text(prompt)],
     }];
 
-    // Progress tracking with real-time updates
     let progress = Arc::new(Mutex::new(SubagentProgress::new()));
     let progress_clone = progress.clone();
     let stop_signal = Arc::new(AtomicBool::new(false));
     let stop_signal_clone = stop_signal.clone();
 
-    // Print initial line
     println!(
         "  {} {}",
         format!("[{}]", agent_type).bright_magenta(),
         description
     );
 
-    // Spawn background thread to update progress
     let updater = spawn_subagent_progress_updater(
         agent_type.to_string(),
         description.to_string(),
@@ -826,7 +1094,6 @@ Complete the task and return a clear, concise summary."#,
 
     let mut consecutive_truncations = 0;
 
-    // Run the same agent loop (with real-time progress display)
     let result = loop {
         let request = MessagesRequestBuilder::new(&config.model, sub_messages.clone(), 8000)
             .system(SystemPrompt::Text(sub_system.clone()))
@@ -843,7 +1110,6 @@ Complete the task and return a clear, concise summary."#,
             Err(e) => break format!("Error calling API: {}", e),
         };
 
-        // Handle different stop reasons
         match response.stop_reason {
             Some(StopReason::MaxTokens) => {
                 consecutive_truncations += 1;
@@ -862,7 +1128,6 @@ Complete the task and return a clear, concise summary."#,
                     );
                 }
 
-                // Add truncation handling message
                 sub_messages.push(Message {
                     role: Role::Assistant,
                     content: response.content,
@@ -879,18 +1144,15 @@ Complete the task and return a clear, concise summary."#,
             }
 
             Some(StopReason::ToolUse) => {
-                consecutive_truncations = 0; // Reset counter
+                consecutive_truncations = 0;
 
-                // Execute tool calls
                 let mut results = Vec::new();
                 for block in &response.content {
                     if let ContentBlock::ToolUse { id, name, input } = block {
-                        // Update progress: increment count and show current tool
                         {
                             let mut progress_guard = progress.lock().unwrap();
                             progress_guard.tool_count += 1;
 
-                            // Format tool display based on type
                             let tool_display = match name.as_str() {
                                 "bash" => {
                                     if let Some(cmd) = input.get("command").and_then(|v| v.as_str())
@@ -926,13 +1188,21 @@ Complete the task and return a clear, concise summary."#,
                                         "edit_file".to_string()
                                     }
                                 }
+                                "Skill" => {
+                                    if let Some(skill) = input.get("skill").and_then(|v| v.as_str())
+                                    {
+                                        format!("skill: {}", skill)
+                                    } else {
+                                        "Skill".to_string()
+                                    }
+                                }
                                 other => other.to_string(),
                             };
 
                             progress_guard.current_tool = Some(tool_display);
                         }
 
-                        let output = execute_tool(config, todo_manager, name, input);
+                        let output = execute_tool(config, todo_manager, skill_loader, name, input);
 
                         results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
@@ -940,7 +1210,6 @@ Complete the task and return a clear, concise summary."#,
                             content: anthropic::types::ToolResultContent::Text(output),
                         });
 
-                        // Clear current tool after execution
                         {
                             let mut progress_guard = progress.lock().unwrap();
                             progress_guard.current_tool = None;
@@ -959,7 +1228,7 @@ Complete the task and return a clear, concise summary."#,
             }
 
             Some(StopReason::EndTurn) | Some(StopReason::StopSequence) | None => {
-                // Extract final text and return
+                // Normal end - extract text and return
                 let mut text_result = None;
                 for block in &response.content {
                     if let ContentBlock::Text { text } = block {
@@ -972,17 +1241,14 @@ Complete the task and return a clear, concise summary."#,
         }
     };
 
-    // Stop the updater thread
     stop_signal.store(true, Ordering::Relaxed);
-    updater.join().ok(); // Wait for the thread to finish
+    updater.join().ok();
 
-    // Clear the progress lines and show final result
     let progress_guard = progress.lock().unwrap();
     let elapsed = progress_guard.start_time.elapsed();
     let tool_count = progress_guard.tool_count;
     drop(progress_guard);
 
-    // Move up, clear both lines, and print final status
     print!("\x1B[1A\x1B[K\x1B[1A\x1B[K");
 
     if result.starts_with("[ERROR]") {
@@ -1011,6 +1277,7 @@ Complete the task and return a clear, concise summary."#,
 fn execute_tool(
     config: &Config,
     todo_manager: &TodoManager,
+    skill_loader: &SkillLoader,
     name: &str,
     input: &serde_json::Value,
 ) -> String {
@@ -1066,15 +1333,19 @@ fn execute_tool(
                 "Error: Missing 'items' parameter".to_string()
             }
         }
+        "Skill" => {
+            let skill_name = input.get("skill").and_then(|v| v.as_str()).unwrap_or("");
+            run_skill(skill_loader, skill_name)
+        }
         _ => format!("Unknown tool: {}", name),
     }
 }
 
-// For Task tool, we need async execution
 async fn execute_tool_async(
     client: &Client,
     config: &Config,
     todo_manager: &TodoManager,
+    skill_loader: &SkillLoader,
     name: &str,
     input: &serde_json::Value,
 ) -> String {
@@ -1093,23 +1364,23 @@ async fn execute_tool_async(
             client,
             config,
             todo_manager,
+            skill_loader,
             description,
             prompt,
             agent_type,
         )
         .await
     } else {
-        execute_tool(config, todo_manager, name, input)
+        execute_tool(config, todo_manager, skill_loader, name, input)
     }
 }
 
 // =============================================================================
-// Token Management Helpers
+// Token Management (from v3)
 // =============================================================================
 
-/// Estimate the number of tokens in the message history (rough approximation)
-fn estimate_context_tokens(messages: &[Message]) -> usize {
-    messages
+fn estimate_context_tokens(messages: &[Message], system: &str) -> usize {
+    let messages_tokens: usize = messages
         .iter()
         .map(|msg| {
             msg.content
@@ -1127,132 +1398,78 @@ fn estimate_context_tokens(messages: &[Message]) -> usize {
                 })
                 .sum::<usize>()
         })
-        .sum()
+        .sum();
+
+    let system_tokens = system.len() / 4;
+    messages_tokens + system_tokens
 }
 
-/// Calculate appropriate max_tokens based on context length and config
-fn calculate_max_tokens(context_tokens: usize, max_configured: u32) -> u32 {
-    const MAX_CONTEXT: usize = 200000; // Claude's context window
-    const OUTPUT_RATIO: f64 = 0.4; // Use 40% of remaining space for output
+fn calculate_max_tokens(messages: &[Message], system: &str, max_output_tokens: u32) -> u32 {
+    const MAX_CONTEXT: usize = 200000;
+    const OUTPUT_RATIO: f64 = 0.4;
 
-    let available = MAX_CONTEXT.saturating_sub(context_tokens);
+    let context = estimate_context_tokens(messages, system);
+    let available = MAX_CONTEXT.saturating_sub(context);
     let max_output = (available as f64 * OUTPUT_RATIO) as u32;
 
-    // Keep within reasonable bounds and configured maximum
-    max_output.max(4000).min(max_configured)
+    max_output.min(max_output_tokens).max(4000)
 }
 
 // =============================================================================
-// Main Agent Loop (with subagent support)
+// Main Agent Loop (adapted for v4 with Skills + Task + Todo)
 // =============================================================================
 
 async fn agent_loop(
     client: &Client,
     config: &Config,
-    todo_manager: &TodoManager,
+    skill_loader: &SkillLoader,
     messages: &mut Vec<Message>,
 ) -> Result<()> {
-    let tools = create_all_tools();
+    let todo_manager = TodoManager::new();
+
+    let skill_descriptions = skill_loader.get_descriptions();
+    let agent_descriptions = get_agent_descriptions();
+    let system = config.system_prompt(&skill_descriptions, &agent_descriptions);
+
+    let tools = create_all_tools(skill_loader);
+
     let mut consecutive_truncations = 0;
 
     loop {
-        // Calculate dynamic max_tokens based on context and config
-        let context_tokens = estimate_context_tokens(messages);
-        let max_output = calculate_max_tokens(context_tokens, config.max_output_tokens);
+        let max_tokens = calculate_max_tokens(messages, &system, config.max_output_tokens);
 
-        let request = MessagesRequestBuilder::new(&config.model, messages.clone(), max_output)
-            .system(SystemPrompt::Text(config.system_prompt()))
+        let request = MessagesRequestBuilder::new(&config.model, messages.clone(), max_tokens)
+            .system(SystemPrompt::Text(system.clone()))
             .tools(tools.clone())
             .build()?;
 
-        let start = Instant::now();
-        let _animation = spawn_thinking_animation();
+        let animation = spawn_thinking_animation();
+        let response = client.messages(request).await?;
+        drop(animation);
 
-        let api_call = client.messages(request);
-        let timeout_duration = Duration::from_secs(600);
-
-        let response = match tokio::time::timeout(timeout_duration, api_call).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(e)) => {
-                drop(_animation);
-                eprintln!("\n{}: {}", "API Error".bright_red(), e);
-                return Err(e.into());
-            }
-            Err(_) => {
-                drop(_animation);
-                eprintln!(
-                    "\n{}: Request timed out after 10 minutes",
-                    "API Error".bright_red()
-                );
-                return Err(anyhow::anyhow!("Request timed out after 10 minutes"));
-            }
-        };
-
-        let elapsed = start.elapsed();
-        drop(_animation);
-
-        let usage = &response.usage;
-        println!(
-            "{}",
-            format!(
-                "in: {} out: {} max: {} {:.1}s",
-                usage.input_tokens,
-                usage.output_tokens,
-                max_output,
-                elapsed.as_secs_f64()
-            )
-            .bright_black()
-        );
-
-        // Handle different stop reasons
         match response.stop_reason {
             Some(StopReason::MaxTokens) => {
                 consecutive_truncations += 1;
 
-                if consecutive_truncations >= config.max_truncation_retries {
-                    eprintln!(
-                        "\n{}",
-                        format!(
-                            "Error: Response truncated {} times in a row. Task may be too complex.",
-                            consecutive_truncations
-                        )
-                        .bright_red()
-                    );
-                    eprintln!(
-                        "{}",
-                        "Hint: Break the task into smaller steps, or write large outputs to files using write_file."
-                            .bright_yellow()
-                    );
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "You can also increase MINI_CODE_MAX_OUTPUT_TOKENS (current: {})",
-                            config.max_output_tokens
-                        )
-                        .bright_yellow()
-                    );
-                    return Err(anyhow::anyhow!(
-                        "Task too complex, please break it into smaller steps"
-                    ));
-                }
-
-                eprintln!(
-                    "\n{}",
+                println!(
+                    "{} {}",
+                    "Warning:".bright_yellow(),
                     format!(
-                        "Warning: Response truncated (attempt {}/{}). Asking model to provide a summary...",
-                        consecutive_truncations,
-                        config.max_truncation_retries
+                        "Response truncated (attempt {}/{})",
+                        consecutive_truncations, config.max_truncation_retries
                     )
-                    .bright_yellow()
+                    .bright_black()
                 );
 
-                // Extract and display any text output
-                for block in &response.content {
-                    if let ContentBlock::Text { text } = block {
-                        if !text.trim().is_empty() {
-                            println!("{}", text);
-                        }
-                    }
+                if consecutive_truncations >= config.max_truncation_retries {
+                    anyhow::bail!(
+                        "Error: Response truncated {} times in a row. Task may be too complex.\n\n\
+                         Hint: Break the task into smaller steps, or write large outputs\n\
+                         to files using write_file.\n\n\
+                         You can also increase MINI_CODE_MAX_OUTPUT_TOKENS (current: {})",
+                        consecutive_truncations,
+                        config.max_output_tokens
+                    );
                 }
 
                 messages.push(Message {
@@ -1263,50 +1480,49 @@ async fn agent_loop(
                 messages.push(Message {
                     role: Role::User,
                     content: vec![ContentBlock::text(
-                        "[SYSTEM: Your previous response was truncated due to length. Please provide a brief summary, or write large content to a file using write_file tool.]"
+                        "[SYSTEM: Your response was truncated due to length. \
+                         Please provide a shorter summary of the key points \
+                         (max 3-4 sentences), or write detailed content to a file instead.]",
                     )],
                 });
 
-                continue; // Continue loop to get summary
+                continue;
             }
 
             Some(StopReason::ToolUse) => {
-                consecutive_truncations = 0; // Reset counter
+                consecutive_truncations = 0;
 
-                // Normal tool use - extract tool calls
                 let mut tool_calls = Vec::new();
                 for block in &response.content {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            if !text.trim().is_empty() {
-                                println!("{}", text);
-                            }
-                        }
-                        ContentBlock::ToolUse { id, name, input } => {
-                            tool_calls.push((id.clone(), name.clone(), input.clone()));
-                        }
-                        _ => {}
+                    if let ContentBlock::ToolUse { id, name, input } = block {
+                        tool_calls.push((id.clone(), name.clone(), input.clone()));
                     }
                 }
 
-                // Execute tools and continue loop
                 let mut results = Vec::new();
-
                 for (id, name, input) in tool_calls {
                     // Display tool call
                     let tool_display = match name.as_str() {
                         "Task" => format!("{} {}", ">".bright_blue(), name.bright_magenta()),
+                        "Skill" => format!("{} {}", ">".bright_blue(), name.bright_green()),
                         "TodoWrite" => format!("{} {}", ">".bright_blue(), name.bright_magenta()),
                         "bash" => format!("{} {}", ">".bright_blue(), name.bright_yellow()),
                         _ => format!("{} {}", ">".bright_blue(), name.bright_cyan()),
                     };
                     println!("\n{}", tool_display);
 
-                    let output =
-                        execute_tool_async(client, config, todo_manager, &name, &input).await;
+                    let output = execute_tool_async(
+                        client,
+                        config,
+                        &todo_manager,
+                        skill_loader,
+                        &name,
+                        &input,
+                    )
+                    .await;
 
                     // Display output
-                    let preview = if name == "TodoWrite" || name == "Task" {
+                    let preview = if name == "TodoWrite" || name == "Task" || name == "Skill" {
                         output.clone()
                     } else if output.len() > 300 {
                         format!("{}...", safe_truncate(&output, 300))
@@ -1320,6 +1536,12 @@ async fn agent_loop(
                         println!("{}", preview.bright_green());
                     } else if name == "Task" {
                         // Task output already printed by run_task
+                    } else if name == "Skill" {
+                        println!(
+                            "{} {}",
+                            "Skill loaded:".bright_green(),
+                            preview.lines().next().unwrap_or("").bright_black()
+                        );
                     } else {
                         println!("  {}", preview.bright_black());
                     }
@@ -1363,7 +1585,7 @@ async fn agent_loop(
 }
 
 // =============================================================================
-// Client initialization (from v2, unchanged)
+// Client Initialization (from v3)
 // =============================================================================
 
 fn create_client() -> Result<Client> {
@@ -1393,424 +1615,103 @@ fn create_client() -> Result<Client> {
 }
 
 // =============================================================================
-// Input handling (from v2, unchanged)
+// Input Handling (from v3)
 // =============================================================================
+
+#[cfg(feature = "readline")]
+fn prompt_user() -> Result<String> {
+    let mut rl = Editor::<(), DefaultHistory>::new()?;
+
+    match rl.readline("You: ") {
+        Ok(line) => {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("Empty input")
+            }
+            Ok(trimmed.to_string())
+        }
+        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+            println!("\nExiting...");
+            std::process::exit(0);
+        }
+        Err(e) => Err(e.into()),
+    }
+}
 
 #[cfg(not(feature = "readline"))]
 fn prompt_user() -> Result<String> {
-    print!("{} ", "You:".bright_cyan());
+    print!("You: ");
     io::stdout().flush()?;
 
     let stdin = io::stdin();
     let mut line = String::new();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .context("Failed to read from stdin")?;
+    stdin.lock().read_line(&mut line)?;
 
-    Ok(line.trim().to_string())
-}
-
-#[cfg(feature = "readline")]
-fn prompt_user_with_rl(editor: &mut Editor<(), DefaultHistory>) -> Result<String> {
-    let readline = editor.readline(&format!("{} ", "You:".bright_cyan()));
-
-    match readline {
-        Ok(line) => {
-            let _ = editor.add_history_entry(&line);
-            Ok(line.trim().to_string())
-        }
-        Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => Ok("exit".to_string()),
-        Err(err) => Err(anyhow::anyhow!("Readline error: {}", err)),
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Empty input")
     }
+
+    Ok(trimmed.to_string())
 }
 
 // =============================================================================
-// Main REPL
+// Main Entry Point
 // =============================================================================
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let client = create_client()?;
-    let todo_manager = TodoManager::new();
+    let skill_loader = SkillLoader::new(&config.skills_dir);
 
+    // Display startup info
+    println!("{}", "=".repeat(60).bright_black());
     println!(
-        "{}",
-        format!(
-            "Mini Claude Code v3 (with Subagents) - {}",
-            config.workdir.display()
-        )
-        .bright_green()
+        "{} {} {}",
+        "Mini Claude Code".bright_cyan().bold(),
+        "v4".bright_magenta(),
+        "(Skills + Subagents + Todo)".bright_black()
     );
-    println!(
-        "{}",
-        format!(
-            "Agent types: {}",
-            get_agent_types()
-                .keys()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-        .bright_black()
-    );
-    println!("{}\n", "Type 'exit' to quit.".bright_black());
+    println!("{}", "=".repeat(60).bright_black());
+    println!("{} {}", "Model:".bright_black(), config.model);
+    println!("{} {}", "Workdir:".bright_black(), config.workdir.display());
 
-    let mut history: Vec<Message> = Vec::new();
-
-    #[cfg(feature = "readline")]
-    let mut rl = Editor::<(), DefaultHistory>::new()?;
-
-    loop {
-        let user_input = {
-            #[cfg(feature = "readline")]
-            {
-                prompt_user_with_rl(&mut rl)?
-            }
-            #[cfg(not(feature = "readline"))]
-            {
-                prompt_user()?
-            }
-        };
-
-        if user_input.is_empty()
-            || matches!(user_input.to_lowercase().as_str(), "exit" | "quit" | "q")
-        {
-            break;
+    let skill_count = skill_loader.list_skills().len();
+    if skill_count > 0 {
+        println!("{} {} skills loaded", "Skills:".bright_green(), skill_count);
+        for skill_name in skill_loader.list_skills() {
+            println!("  {} {}", "-".bright_black(), skill_name.bright_green());
         }
-
-        history.push(Message {
-            role: Role::User,
-            content: vec![ContentBlock::text(user_input)],
-        });
-
-        if let Err(e) = agent_loop(&client, &config, &todo_manager, &mut history).await {
-            eprintln!("{}: {}", "Error".bright_red(), e);
-        }
-
-        println!();
-    }
-
-    Ok(())
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    #[test]
-    fn test_safe_truncate_short_string() {
-        let s = "Hello, World!";
-        assert_eq!(safe_truncate(s, 100), "Hello, World!");
-    }
-
-    #[test]
-    fn test_safe_truncate_utf8() {
-        let s = "你好世界abc";
-        let truncated = safe_truncate(s, 13);
-        assert_eq!(truncated, "你好世界a");
-        assert!(truncated.len() <= 13);
-    }
-
-    #[test]
-    fn test_todo_manager_new() {
-        let manager = TodoManager::new();
-        let rendered = manager.render();
-        assert_eq!(rendered, "No todos.");
-    }
-
-    #[test]
-    fn test_todo_manager_update() {
-        let manager = TodoManager::new();
-        let items = vec![TodoItem {
-            content: "Test task".to_string(),
-            status: TodoStatus::Pending,
-            active_form: "Testing".to_string(),
-        }];
-        let result = manager.update(items);
-        assert!(result.is_ok());
-        let rendered = manager.render();
-        assert!(rendered.contains("[ ] Test task"));
-    }
-
-    #[test]
-    fn test_create_base_tools_count() {
-        let tools = create_base_tools();
-        assert_eq!(
-            tools.len(),
-            5,
-            "Should have 5 base tools (4 from v1 + TodoWrite)"
+    } else {
+        println!(
+            "{} {}",
+            "Skills:".bright_black(),
+            "none (create skills/ folder with SKILL.md files)".bright_yellow()
         );
     }
 
-    #[test]
-    fn test_create_all_tools_count() {
-        let tools = create_all_tools();
-        assert_eq!(tools.len(), 6, "Should have 6 tools (5 base + Task)");
-    }
+    println!("{}", "=".repeat(60).bright_black());
+    println!();
 
-    #[test]
-    fn test_create_all_tools_names() {
-        let tools = create_all_tools();
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"read_file"));
-        assert!(names.contains(&"write_file"));
-        assert!(names.contains(&"edit_file"));
-        assert!(names.contains(&"TodoWrite"));
-        assert!(names.contains(&"Task"));
-    }
+    let mut messages = Vec::new();
 
-    #[test]
-    fn test_get_agent_types() {
-        let types = get_agent_types();
-        assert!(types.contains_key("explore"));
-        assert!(types.contains_key("code"));
-        assert!(types.contains_key("plan"));
-        assert_eq!(types.len(), 3);
-    }
+    loop {
+        let input = match prompt_user() {
+            Ok(input) => input,
+            Err(_) => continue,
+        };
 
-    #[test]
-    fn test_get_tools_for_agent_explore() {
-        let tools = get_tools_for_agent("explore");
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-
-        // Explore should only have bash and read_file
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"read_file"));
-        assert!(!names.contains(&"write_file"));
-        assert!(!names.contains(&"edit_file"));
-        assert_eq!(tools.len(), 2);
-    }
-
-    #[test]
-    fn test_get_tools_for_agent_code() {
-        let tools = get_tools_for_agent("code");
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-
-        // Code agent should have all base tools
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"read_file"));
-        assert!(names.contains(&"write_file"));
-        assert!(names.contains(&"edit_file"));
-        assert!(names.contains(&"TodoWrite"));
-        assert_eq!(tools.len(), 5);
-    }
-
-    #[test]
-    fn test_get_tools_for_agent_plan() {
-        let tools = get_tools_for_agent("plan");
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-
-        // Plan should only have bash and read_file
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"read_file"));
-        assert!(!names.contains(&"write_file"));
-        assert_eq!(tools.len(), 2);
-    }
-
-    #[test]
-    fn test_run_bash_simple() {
-        let workdir = std::env::current_dir().unwrap();
-        let output = run_bash(&workdir, "echo 'test'");
-        assert!(output.contains("test"));
-    }
-
-    #[test]
-    fn test_run_bash_dangerous_blocked() {
-        let workdir = std::env::current_dir().unwrap();
-        let output = run_bash(&workdir, "rm -rf /");
-        assert!(output.contains("Dangerous command blocked"));
-    }
-
-    #[test]
-    fn test_safe_path_valid() {
-        let workdir = std::env::temp_dir();
-        let result = safe_path(&workdir, "test.txt");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_safe_path_escape_attempt() {
-        let workdir = std::env::temp_dir();
-        let result = safe_path(&workdir, "../../../etc/passwd");
-        assert!(result.is_err());
-    }
-
-    // =============================================================================
-    // Token Management Tests (NEW - for crash fix)
-    // =============================================================================
-    //
-    // NOTE: Environment variable tests (test_config_from_env_*) modify process-wide
-    // state and may interfere with each other when run in parallel. To ensure all
-    // tests pass reliably, run with: cargo test -- --test-threads=1
-    //
-    // This is a known limitation of testing code that depends on environment variables.
-
-    #[test]
-    fn test_estimate_context_tokens_empty() {
-        let messages: Vec<Message> = vec![];
-        let tokens = estimate_context_tokens(&messages);
-        assert_eq!(tokens, 0);
-    }
-
-    #[test]
-    fn test_estimate_context_tokens_text() {
-        let messages = vec![Message {
+        messages.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::text("Hello World")],
-        }];
-        let tokens = estimate_context_tokens(&messages);
-        assert!((2..=3).contains(&tokens));
-    }
+            content: vec![ContentBlock::text(input)],
+        });
 
-    #[test]
-    fn test_estimate_context_tokens_multiple_messages() {
-        let messages = vec![
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::text("A".repeat(400))],
-            },
-            Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::text("B".repeat(400))],
-            },
-        ];
-        let tokens = estimate_context_tokens(&messages);
-        assert!((195..=205).contains(&tokens));
-    }
+        if let Err(e) = agent_loop(&client, &config, &skill_loader, &mut messages).await {
+            eprintln!("{} {}", "Error:".bright_red(), e);
+            messages.pop();
+        }
 
-    #[test]
-    fn test_calculate_max_tokens_basic() {
-        let context_tokens = 1000;
-        let max_configured = 160000;
-        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
-
-        // With 1000 context tokens:
-        // Available: 200000 - 1000 = 199000
-        // Output: 199000 * 0.4 = 79600
-        // Should be 79600 (less than max_configured)
-        assert_eq!(max_tokens, 79600);
-    }
-
-    #[test]
-    fn test_calculate_max_tokens_respects_minimum() {
-        let context_tokens = 198000;
-        let max_configured = 160000;
-        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
-
-        // Should be increased to minimum 4000
-        assert_eq!(max_tokens, 4000);
-    }
-
-    #[test]
-    fn test_calculate_max_tokens_respects_configured_max() {
-        let context_tokens = 1000;
-        let max_configured = 8000;
-        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
-
-        assert_eq!(max_tokens, 8000);
-    }
-
-    #[test]
-    fn test_calculate_max_tokens_high_configured() {
-        let context_tokens = 50000;
-        let max_configured = 100000;
-        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
-
-        // With 50000 context: 150000 available * 0.4 = 60000
-        assert_eq!(max_tokens, 60000);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_from_env_defaults() {
-        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
-        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
-
-        let config = Config::from_env().unwrap();
-
-        // v3 defaults differ from v2
-        assert_eq!(config.max_output_tokens, 160000);
-        assert_eq!(config.max_truncation_retries, 3);
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_from_env_custom_values() {
-        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
-        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
-
-        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "32000");
-        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "5");
-
-        let config = Config::from_env().unwrap();
-
-        assert_eq!(config.max_output_tokens, 32000);
-        assert_eq!(config.max_truncation_retries, 5);
-
-        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
-        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_from_env_bounds_checking() {
-        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
-        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
-
-        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "500");
-        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "0");
-
-        let config = Config::from_env().unwrap();
-
-        assert_eq!(config.max_output_tokens, 1000);
-        assert_eq!(config.max_truncation_retries, 1);
-
-        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
-        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_from_env_maximum_bounds() {
-        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
-        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
-
-        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "200000000");
-        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "20");
-
-        let config = Config::from_env().unwrap();
-
-        assert_eq!(config.max_output_tokens, 100_000_000);
-        assert_eq!(config.max_truncation_retries, 10);
-
-        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
-        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_from_env_invalid_values() {
-        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
-        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
-
-        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "invalid");
-        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "not_a_number");
-
-        let config = Config::from_env().unwrap();
-
-        // Should fall back to v3 defaults
-        assert_eq!(config.max_output_tokens, 160000);
-        assert_eq!(config.max_truncation_retries, 3);
-
-        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
-        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+        println!();
     }
 }

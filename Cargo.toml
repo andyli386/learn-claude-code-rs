@@ -10,6 +10,7 @@ members = [
     "crates/v1_basic_agent",
     "crates/v2_todo_agent",
     "crates/v3_subagent",
+    "crates/v4_skills_agent",
 ]
 resolver = "2"
 

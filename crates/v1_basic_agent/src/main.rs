@@ -552,9 +552,8 @@ async fn agent_loop(client: &Client, config: &Config, messages: &mut Vec<Message
                 // Animation stops automatically when _animation is dropped
                 // Timeout occurred
                 eprintln!(
-                    "\n{}: {}",
-                    "API Error".bright_red(),
-                    "Request timed out after 10 minutes"
+                    "\n{}: Request timed out after 10 minutes",
+                    "API Error".bright_red()
                 );
                 eprintln!(
                     "{}",

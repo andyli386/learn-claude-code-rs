@@ -1,15 +1,16 @@
 # Mini Claude Code - 编码代理的渐进式实现
 
-一个通过三个版本逐步演进的项目，展示如何构建一个功能完整的 AI 编码代理。每个版本都建立在前一个版本的基础上，逐步添加功能和复杂性。
+一个通过四个版本逐步演进的项目，展示如何构建一个功能完整的 AI 编码代理。每个版本都建立在前一个版本的基础上，逐步添加功能和复杂性。
 
 ## 项目概览
 
-这是一个 Rust workspace 项目，包含四个独立的 crate，代表编码代理的四个演进阶段：
+这是一个 Rust workspace 项目，包含五个独立的 crate，代表编码代理的五个演进阶段：
 
 - **v0_bash_agent**: 极简代理 - 仅使用 bash 工具
 - **v1_basic_agent**: 基础代理 - 添加 4 个核心工具
 - **v2_todo_agent**: 高级代理 - 增加任务规划和可见性
 - **v3_subagent**: 子代理机制 - 通过上下文隔离解决复杂任务
+- **v4_skills_agent**: 技能机制 - 知识外部化，按需加载专业领域知识
 
 每个版本都是完全可用的，展示了从简单到复杂的设计演进。
 
@@ -39,13 +40,17 @@
 
 ## 版本对比
 
-| 特性 | v0_bash_agent | v1_basic_agent | v2_todo_agent | v3_subagent |
-|------|--------------|----------------|---------------|-------------|
-| 工具数量 | 1 (bash) | 4 (bash + 文件操作) | 5 (增加 TodoWrite) | 6 (增加 Task) |
-| 代码行数 | ~200 行 | ~500 行 | ~800 行 | ~900 行 |
-| 子代理支持 | ✅ 进程级隔离 | ❌ | ❌ | ✅ 上下文隔离 |
-| 任务规划 | ❌ | ❌ | ✅ 可见任务列表 | ✅ 可见任务列表 |
-| 适用场景 | 快速原型、单步任务 | 日常编码 | 复杂重构、多步骤任务 | 超大型任务、探索+实现 |
+| 特性 | v0_bash_agent | v1_basic_agent | v2_todo_agent | v3_subagent | v4_skills_agent |
+|------|--------------|----------------|---------------|-------------|-----------------|
+| 工具数量 | 1 (bash) | 4 (bash + 文件操作) | 5 (增加 TodoWrite) | 6 (增加 Task) | 7 (增加 Skill) |
+| 代码行数 | ~200 行 | ~500 行 | ~850 行 | ~1400 行 | ~1700 行 |
+| 单元测试 | 10 个 | 12 个 | 29 个 | 27 个 | 待补充 |
+| Clippy 警告 | 0 ✅ | 0 ✅ | 0 ✅ | 0 ✅ | 0 ✅ |
+| 子代理支持 | ✅ 进程级隔离 | ❌ | ❌ | ✅ 上下文隔离 | ✅ 上下文隔离 |
+| 任务规划 | ❌ | ❌ | ✅ 可见任务列表 | ✅ 可见任务列表 | ✅ 可见任务列表 |
+| 技能加载 | ❌ | ❌ | ❌ | ❌ | ✅ 按需加载专业知识 |
+| 子代理技能 | ❌ | ❌ | ❌ | ❌ | ✅ 支持 |
+| 适用场景 | 快速原型、单步任务 | 日常编码 | 复杂重构、多步骤任务 | 超大型任务、探索+实现 | 需要专业领域知识的任务 |
 
 ## 快速开始
 
@@ -107,6 +112,34 @@ cargo run -p v3_subagent
 
 # 不使用 readline
 cargo run -p v3_subagent --no-default-features
+```
+
+#### v4 - 技能机制（专业领域知识）
+
+```bash
+# 运行（默认启用 readline 支持）
+cargo run -p v4_skills_agent
+
+# 不使用 readline
+cargo run -p v4_skills_agent --no-default-features
+```
+
+**创建技能**:
+```bash
+# 创建技能目录
+mkdir -p skills/my-skill
+
+# 创建 SKILL.md
+cat > skills/my-skill/SKILL.md << 'EOF'
+---
+name: my-skill
+description: 技能简短描述
+---
+
+# 我的技能
+
+详细的使用说明...
+EOF
 ```
 
 ## 版本详解
@@ -273,6 +306,103 @@ cargo run -p v3_subagent --no-default-features
 - 多阶段的复杂重构
 - 需要保持主对话清晰的任务
 
+### v4: 知识外部化
+
+**核心哲学**: "技能即知识" - 将专业领域知识存储在文件中，按需加载，而非锁定在模型参数中。
+
+**新增内容**:
+- Skill 工具：按需加载专业领域知识
+- SkillLoader：解析 SKILL.md 文件（YAML frontmatter + Markdown body）
+- 渐进式披露：三层架构（元数据 → 内容 → 资源）
+- 缓存保护注入：通过 tool_result 注入技能，保持 system prompt 不变
+
+**技能结构**:
+
+```
+skills/
+├── pdf/
+│   ├── SKILL.md          # 必需：YAML + Markdown
+│   ├── scripts/          # 可选：辅助脚本
+│   └── references/       # 可选：参考文档
+└── mcp-builder/
+    └── SKILL.md
+```
+
+**SKILL.md 格式**:
+
+```markdown
+---
+name: pdf
+description: 处理 PDF 文件。用于读取、创建或合并 PDF。
+---
+
+# PDF 处理技能
+
+## 读取 PDF
+
+使用 pdftotext 快速提取：
+\```bash
+pdftotext input.pdf -
+\```
+
+复杂表格使用 PyMuPDF：
+\```python
+import fitz
+doc = fitz.open("input.pdf")
+for page in doc:
+    print(page.get_text())
+\```
+```
+
+**渐进式披露**:
+
+```
+Layer 1: 元数据（始终加载）         ~100 tokens/skill
+         仅 name + description
+
+Layer 2: SKILL.md 内容（触发时）    ~2000 tokens
+         详细指令
+
+Layer 3: 资源（按需）               无限制
+         scripts/, references/, assets/
+```
+
+**工作流程示例**:
+
+```
+用户: 帮我从 PDF 提取文本
+
+主代理:
+  > Skill pdf
+    加载技能: # Skill: pdf
+
+  > bash pdftotext document.pdf -
+    [PDF 文本内容...]
+
+  提取成功！PDF 包含...
+```
+
+**关键优势**:
+- **知识外部化**: 专业知识存储在可编辑文件中
+- **零训练成本**: 添加新技能只需写 Markdown 文件
+- **缓存友好**: 技能通过 tool_result 注入，不污染缓存
+- **可扩展**: 任何人都可以创建技能
+
+**工具 vs 技能**:
+
+| 概念 | 是什么 | 示例 |
+|------|--------|------|
+| **工具** | 模型能做什么 | bash, read_file, write |
+| **技能** | 模型如何知道 | PDF 处理, MCP 开发 |
+
+工具是能力，技能是知识。
+
+**何时使用**:
+- 需要特定领域专业知识（PDF、MCP、代码审查）
+- 想要标准化工作流程
+- 需要分享最佳实践
+- 构建可复用的知识库
+
 ## 架构设计
 
 ### 工作空间结构
@@ -295,11 +425,21 @@ mini-code/
 │   │   ├── src/
 │   │   │   └── main.rs       # 完整实现 + 测试
 │   │   └── Cargo.toml
-│   └── v3_subagent/          # 子代理版本
+│   ├── v3_subagent/          # 子代理版本
+│   │   ├── src/
+│   │   │   └── main.rs       # 完整实现 + 子代理支持
+│   │   ├── Cargo.toml
+│   │   └── README.md         # 详细文档
+│   └── v4_skills_agent/      # 技能版本
 │       ├── src/
-│       │   └── main.rs       # 完整实现 + 子代理支持
+│       │   └── main.rs       # 完整实现 + 技能加载
 │       ├── Cargo.toml
 │       └── README.md         # 详细文档
+├── skills/                   # 技能目录（可选，用于 v4）
+│   ├── pdf/
+│   │   └── SKILL.md
+│   └── mcp-builder/
+│       └── SKILL.md
 ├── .env.example              # 环境变量模板
 └── README.md
 ```
@@ -359,6 +499,32 @@ MODEL_NAME=claude-sonnet-4-5-20250929
 - `claude-sonnet-4-5-20250929` (更快，推荐)
 - `claude-opus-4-5-20251101` (更强大)
 
+## 代码质量
+
+项目通过了所有 Rust 代码质量检查：
+
+### Clippy 检查
+
+```bash
+# 检查所有 crates 的代码质量
+cargo clippy --workspace
+# ✅ 0 warnings
+
+# 查看详细修复记录
+cat WORKSPACE_CLIPPY_FIXES.md
+cat CLIPPY_FIXES.md  # v4 详细记录
+```
+
+**已修复的警告类型**:
+- ✅ `manual_clamp`: 使用 `.clamp()` 替代 `.max().min()`
+- ✅ `print_with_newline`: 使用 `println!()` 替代 `print!("...\n")`
+- ✅ `print_literal`: 优化 `eprintln!()` 格式
+- ✅ `unused_assignments`: 移除无用赋值
+- ✅ `useless_vec`: 数组替代 `vec![]`（常量场景）
+- ✅ `manual_range_patterns`: 使用 `.contains()` 替代范围检查
+
+详见 [WORKSPACE_CLIPPY_FIXES.md](./WORKSPACE_CLIPPY_FIXES.md) 获取完整修复记录。
+
 ## 开发工具
 
 项目配置了多个开发工具：
@@ -368,6 +534,9 @@ MODEL_NAME=claude-sonnet-4-5-20250929
 ```bash
 # 依赖安全检查
 cargo deny check
+
+# 代码质量检查（已全部通过 ✅）
+cargo clippy --workspace
 
 # 拼写检查
 typos
@@ -396,24 +565,41 @@ pre-commit run --all-files
 
 ```bash
 # 运行所有测试
-cargo test
+cargo test --workspace
 
 # 运行特定版本的测试
 cargo test -p v0_bash_agent
 cargo test -p v1_basic_agent
-cargo test -p v2_todo_agent
-cargo test -p v3_subagent
+cargo test -p v4_skills_agent
+
+# v2 和 v3 的环境变量测试需要单线程运行
+cargo test -p v2_todo_agent -- --test-threads=1
+cargo test -p v3_subagent -- --test-threads=1
 
 # 使用 nextest（更快）
 cargo nextest run
 ```
 
+### 测试注意事项
+
+**环境变量测试**: v2_todo_agent 和 v3_subagent 包含环境变量配置测试。由于环境变量是进程全局的，这些测试在并行运行时可能相互干扰。
+
+**解决方案**:
+```bash
+# 使用单线程运行这些测试
+cargo test -p v2_todo_agent -- --test-threads=1
+cargo test -p v3_subagent -- --test-threads=1
+```
+
+每个测试都在开始时清除环境变量以避免干扰，但单线程运行更可靠。
+
 ### 测试覆盖
 
 - **v0**: bash 命令执行、系统提示生成
 - **v1**: UTF-8 截断、路径安全、工具创建
-- **v2**: TodoManager 验证、约束执行、完整工作流
-- **v3**: Agent 类型注册、工具过滤、子代理隔离
+- **v2**: TodoManager 验证、约束执行、环境配置、完整工作流
+- **v3**: Agent 类型注册、工具过滤、子代理隔离、环境配置
+- **v4**: SkillLoader、技能解析、工具集成
 
 ## 使用示例
 
@@ -558,11 +744,21 @@ MIT License
 
 ## 相关文档
 
+### 功能改进
 - [TIMEOUT_IMPROVEMENTS.md](./TIMEOUT_IMPROVEMENTS.md) - 超时处理改进
 - [UTF8_TRUNCATION_FIX.md](./UTF8_TRUNCATION_FIX.md) - UTF-8 截断修复
 - [ERROR_HANDLING_IMPROVEMENTS.md](./ERROR_HANDLING_IMPROVEMENTS.md) - 错误处理改进
-- [UNIT_TESTS.md](./UNIT_TESTS.md) - 单元测试说明
 - [UI_IMPROVEMENTS.md](./UI_IMPROVEMENTS.md) - UI 改进
+- [UNIT_TESTS.md](./UNIT_TESTS.md) - 单元测试说明
+
+### 代码质量
+- [WORKSPACE_CLIPPY_FIXES.md](./WORKSPACE_CLIPPY_FIXES.md) - 完整工作空间 Clippy 警告修复记录
+- [CLIPPY_FIXES.md](./CLIPPY_FIXES.md) - v4_skills_agent 详细修复记录
+- [CRASH_FIX_SUMMARY.md](./CRASH_FIX_SUMMARY.md) - Token 管理修复
+
+### 新特性
+- [SUBAGENT_SKILLS_SUPPORT.md](./SUBAGENT_SKILLS_SUPPORT.md) - 子代理技能支持说明
+- [ENV_CONFIG_QUICK.md](./ENV_CONFIG_QUICK.md) - 环境变量配置参考
 
 ## 常见问题
 

@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
 
     println!("=== Testing Different Header Combinations ===\n");
 
-    let test_cases = vec![
+    let test_cases = [
         ("claude-code/2.1.2", Some("claude-code/2.1.2")),
         ("claude-code/2.1.2", Some("Claude Code/2.1.2")),
         ("claude-code/2.1.2", None),

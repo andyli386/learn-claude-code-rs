@@ -1,20 +1,18 @@
 [package]
-name = "v3_subagent"
+name = "v4_skills_agent"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 anthropic.workspace = true
-tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-dotenvy.workspace = true
 anyhow.workspace = true
 colored.workspace = true
+dotenvy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+regex = "1.11"
 rustyline = { workspace = true, optional = true }
-
-[dev-dependencies]
-serial_test = "3"
 
 [features]
 default = ["readline"]

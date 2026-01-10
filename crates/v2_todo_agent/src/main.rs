@@ -150,16 +150,14 @@ impl Config {
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(160000)
-            .max(1000) // Minimum 1000 tokens
-            .min(100_000_000); // Maximum 100M tokens (Claude's limit)
+            .clamp(1000, 100_000_000); // Clamp between 1000 and 100M tokens
 
         // Read max truncation retries, default to 3
         let max_truncation_retries = env::var("MINI_CODE_MAX_TRUNCATION_RETRIES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(3)
-            .max(1) // At least 1 retry
-            .min(10); // Max 10 retries
+            .clamp(1, 10); // Clamp between 1 and 10 retries
 
         Ok(Self {
             model,
@@ -781,9 +779,8 @@ async fn agent_loop(
                 // Animation stops automatically when _animation is dropped
                 // Timeout occurred
                 eprintln!(
-                    "\n{}: {}",
-                    "API Error".bright_red(),
-                    "Request timed out after 10 minutes"
+                    "\n{}: Request timed out after 10 minutes",
+                    "API Error".bright_red()
                 );
                 eprintln!(
                     "{}",
@@ -886,8 +883,6 @@ async fn agent_loop(
             }
 
             Some(StopReason::EndTurn) | Some(StopReason::StopSequence) | None => {
-                consecutive_truncations = 0; // Reset counter
-
                 // Normal end - display text and return
                 for block in &response.content {
                     if let ContentBlock::Text { text } = block {
@@ -1182,6 +1177,7 @@ This helps maintain visibility and focus.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_safe_truncate_short_string() {
@@ -1412,7 +1408,7 @@ mod tests {
         }];
         let tokens = estimate_context_tokens(&messages);
         // Should estimate ~2-3 tokens (11 chars / 4)
-        assert!(tokens >= 2 && tokens <= 3);
+        assert!((2..=3).contains(&tokens));
     }
 
     #[test]
@@ -1429,7 +1425,7 @@ mod tests {
         ];
         let tokens = estimate_context_tokens(&messages);
         // Should estimate ~200 tokens (800 chars / 4)
-        assert!(tokens >= 195 && tokens <= 205);
+        assert!((195..=205).contains(&tokens));
     }
 
     #[test]
@@ -1482,6 +1478,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_config_from_env_defaults() {
         // Clear environment variables
         std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
@@ -1496,7 +1493,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_config_from_env_custom_values() {
+        // Clear environment variables first to avoid interference
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+
         // Set custom values
         std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "32000");
         std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "5");
@@ -1513,7 +1515,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_config_from_env_bounds_checking() {
+        // Clear environment variables first to avoid interference
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+
         // Test minimum bounds
         std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "500"); // Below min (1000)
         std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "0"); // Below min (1)
@@ -1530,7 +1537,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_config_from_env_maximum_bounds() {
+        // Clear environment variables first to avoid interference
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+
         // Test maximum bounds
         std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "200000000"); // Above max (100M)
         std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "20"); // Above max (10)
@@ -1547,7 +1559,12 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_config_from_env_invalid_values() {
+        // Clear environment variables first to avoid interference
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+
         // Set invalid (non-numeric) values
         std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "invalid");
         std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "not_a_number");

@@ -22,3 +22,6 @@ colored = { workspace = true }
 
 # Optional: for better UTF-8 input handling
 rustyline = { workspace = true, optional = true }
+
+[dev-dependencies]
+serial_test = "3"
