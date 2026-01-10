@@ -133,6 +133,8 @@ impl Drop for ThinkingAnimation {
 struct Config {
     model: String,
     workdir: PathBuf,
+    max_output_tokens: u32,
+    max_truncation_retries: usize,
 }
 
 impl Config {
@@ -143,7 +145,28 @@ impl Config {
             env::var("MODEL_NAME").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
         let workdir = env::current_dir().context("Failed to get current directory")?;
 
-        Ok(Self { model, workdir })
+        // Read MINI_CODE_MAX_OUTPUT_TOKENS from environment, default to 160000
+        let max_output_tokens = env::var("MINI_CODE_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(160000)
+            .max(1000) // Minimum 1000 tokens
+            .min(100_000_000); // Maximum 100M tokens (Claude's limit)
+
+        // Read max truncation retries, default to 3
+        let max_truncation_retries = env::var("MINI_CODE_MAX_TRUNCATION_RETRIES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(3)
+            .max(1) // At least 1 retry
+            .min(10); // Max 10 retries
+
+        Ok(Self {
+            model,
+            workdir,
+            max_output_tokens,
+            max_truncation_retries,
+        })
     }
 
     fn system_prompt(&self) -> String {
@@ -644,6 +667,45 @@ fn execute_tool(
 }
 
 // =============================================================================
+// Token Management Helpers
+// =============================================================================
+
+/// Estimate the number of tokens in the message history (rough approximation)
+fn estimate_context_tokens(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|msg| {
+            msg.content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Text { text } => text.len() / 4, // Rough: 4 chars ≈ 1 token
+                    ContentBlock::ToolUse { input, .. } => {
+                        serde_json::to_string(input).unwrap_or_default().len() / 4
+                    }
+                    ContentBlock::ToolResult { content, .. } => match content {
+                        anthropic::types::ToolResultContent::Text(t) => t.len() / 4,
+                        _ => 100, // Default estimate
+                    },
+                    _ => 0,
+                })
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+/// Calculate appropriate max_tokens based on context length and config
+fn calculate_max_tokens(context_tokens: usize, max_configured: u32) -> u32 {
+    const MAX_CONTEXT: usize = 200000; // Claude's context window
+    const OUTPUT_RATIO: f64 = 0.4; // Use 40% of remaining space for output
+
+    let available = MAX_CONTEXT.saturating_sub(context_tokens);
+    let max_output = (available as f64 * OUTPUT_RATIO) as u32;
+
+    // Keep within reasonable bounds and configured maximum
+    max_output.max(4000).min(max_configured)
+}
+
+// =============================================================================
 // Agent Loop (with todo tracking)
 // =============================================================================
 
@@ -655,9 +717,14 @@ async fn agent_loop(
     rounds_without_todo: &mut usize,
 ) -> Result<()> {
     let tools = create_tools();
+    let mut consecutive_truncations = 0;
 
     loop {
-        let request = MessagesRequestBuilder::new(&config.model, messages.clone(), 8000)
+        // Calculate dynamic max_tokens based on context and config
+        let context_tokens = estimate_context_tokens(messages);
+        let max_output = calculate_max_tokens(context_tokens, config.max_output_tokens);
+
+        let request = MessagesRequestBuilder::new(&config.model, messages.clone(), max_output)
             .system(SystemPrompt::Text(config.system_prompt()))
             .tools(tools.clone())
             .build()?;
@@ -740,12 +807,105 @@ async fn agent_loop(
         println!(
             "{}",
             format!(
-                "in: {} out: {} {:.1}s",
-                usage.input_tokens, usage.output_tokens, elapsed_secs
+                "in: {} out: {} max: {} {:.1}s",
+                usage.input_tokens, usage.output_tokens, max_output, elapsed_secs
             )
             .bright_black()
         );
 
+        // Handle different stop reasons
+        match response.stop_reason {
+            Some(StopReason::MaxTokens) => {
+                consecutive_truncations += 1;
+
+                if consecutive_truncations >= config.max_truncation_retries {
+                    eprintln!(
+                        "\n{}",
+                        format!(
+                            "Error: Response truncated {} times in a row. Task may be too complex.",
+                            consecutive_truncations
+                        )
+                        .bright_red()
+                    );
+                    eprintln!(
+                        "{}",
+                        "Hint: Break the task into smaller steps, or write large outputs to files using write_file."
+                            .bright_yellow()
+                    );
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "You can also increase MINI_CODE_MAX_OUTPUT_TOKENS (current: {})",
+                            config.max_output_tokens
+                        )
+                        .bright_yellow()
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Task too complex, please break it into smaller steps"
+                    ));
+                }
+
+                eprintln!(
+                    "\n{}",
+                    format!(
+                        "Warning: Response truncated (attempt {}/{}). Asking model to provide a summary...",
+                        consecutive_truncations,
+                        config.max_truncation_retries
+                    )
+                    .bright_yellow()
+                );
+
+                // Extract and display any text output
+                for block in &response.content {
+                    if let ContentBlock::Text { text } = block {
+                        if !text.trim().is_empty() {
+                            println!("{}", text);
+                        }
+                    }
+                }
+
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.content,
+                });
+
+                messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::text(
+                        "[SYSTEM: Your previous response was truncated due to length. Please provide a brief summary, or write large content to a file using write_file tool.]"
+                    )],
+                });
+
+                continue; // Continue loop to get summary
+            }
+
+            Some(StopReason::ToolUse) => {
+                consecutive_truncations = 0; // Reset counter
+
+                // Normal tool use - extract and process tool calls
+            }
+
+            Some(StopReason::EndTurn) | Some(StopReason::StopSequence) | None => {
+                consecutive_truncations = 0; // Reset counter
+
+                // Normal end - display text and return
+                for block in &response.content {
+                    if let ContentBlock::Text { text } = block {
+                        if !text.trim().is_empty() {
+                            println!("{}", text);
+                        }
+                    }
+                }
+
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.content,
+                });
+                return Ok(());
+            }
+        }
+
+        // Tool use handling (only reached if stop_reason is ToolUse)
         let mut tool_calls = Vec::new();
         for block in &response.content {
             match block {
@@ -759,14 +919,6 @@ async fn agent_loop(
                 }
                 _ => {}
             }
-        }
-
-        if response.stop_reason != Some(StopReason::ToolUse) {
-            messages.push(Message {
-                role: Role::Assistant,
-                content: response.content,
-            });
-            return Ok(());
         }
 
         let mut results = Vec::new();
@@ -1198,6 +1350,8 @@ mod tests {
         let config = Config {
             model: "test-model".to_string(),
             workdir: PathBuf::from("/test/path"),
+            max_output_tokens: 160000,
+            max_truncation_retries: 3,
         };
         let prompt = config.system_prompt();
         assert!(prompt.contains("/test/path"));
@@ -1231,5 +1385,181 @@ mod tests {
         let workdir = std::env::temp_dir();
         let result = safe_path(&workdir, "../../../etc/passwd");
         assert!(result.is_err());
+    }
+
+    // =============================================================================
+    // Token Management Tests (NEW - for crash fix)
+    // =============================================================================
+    //
+    // NOTE: Environment variable tests (test_config_from_env_*) modify process-wide
+    // state and may interfere with each other when run in parallel. To ensure all
+    // tests pass reliably, run with: cargo test -- --test-threads=1
+    //
+    // This is a known limitation of testing code that depends on environment variables.
+
+    #[test]
+    fn test_estimate_context_tokens_empty() {
+        let messages: Vec<Message> = vec![];
+        let tokens = estimate_context_tokens(&messages);
+        assert_eq!(tokens, 0);
+    }
+
+    #[test]
+    fn test_estimate_context_tokens_text() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::text("Hello World")], // 11 chars ≈ 2-3 tokens
+        }];
+        let tokens = estimate_context_tokens(&messages);
+        // Should estimate ~2-3 tokens (11 chars / 4)
+        assert!(tokens >= 2 && tokens <= 3);
+    }
+
+    #[test]
+    fn test_estimate_context_tokens_multiple_messages() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::text("A".repeat(400))], // 400 chars ≈ 100 tokens
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::text("B".repeat(400))], // 400 chars ≈ 100 tokens
+            },
+        ];
+        let tokens = estimate_context_tokens(&messages);
+        // Should estimate ~200 tokens (800 chars / 4)
+        assert!(tokens >= 195 && tokens <= 205);
+    }
+
+    #[test]
+    fn test_calculate_max_tokens_basic() {
+        let context_tokens = 1000;
+        let max_configured = 160000;
+        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
+
+        // With 1000 context tokens:
+        // Available: 200000 - 1000 = 199000
+        // Output: 199000 * 0.4 = 79600
+        // Should be 79600 (less than max_configured)
+        assert_eq!(max_tokens, 79600);
+    }
+
+    #[test]
+    fn test_calculate_max_tokens_respects_minimum() {
+        let context_tokens = 198000; // Nearly full context
+        let max_configured = 160000;
+        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
+
+        // With 198000 context tokens:
+        // Available: 200000 - 198000 = 2000
+        // Output: 2000 * 0.4 = 800
+        // Should be increased to minimum 4000
+        assert_eq!(max_tokens, 4000);
+    }
+
+    #[test]
+    fn test_calculate_max_tokens_respects_configured_max() {
+        let context_tokens = 1000;
+        let max_configured = 8000; // Lower than default
+        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
+
+        // Should respect the configured maximum
+        assert_eq!(max_tokens, 8000);
+    }
+
+    #[test]
+    fn test_calculate_max_tokens_high_configured() {
+        let context_tokens = 50000;
+        let max_configured = 100000; // Very high
+        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
+
+        // With 50000 context tokens:
+        // Available: 200000 - 50000 = 150000
+        // Output: 150000 * 0.4 = 60000
+        // Should be 60000 (less than configured max)
+        assert_eq!(max_tokens, 60000);
+    }
+
+    #[test]
+    fn test_config_from_env_defaults() {
+        // Clear environment variables
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+
+        let config = Config::from_env().unwrap();
+
+        // Should use defaults (model may vary based on environment)
+        assert_eq!(config.max_output_tokens, 160000);
+        assert_eq!(config.max_truncation_retries, 3);
+        // Note: model name depends on MODEL_NAME env var, not tested here
+    }
+
+    #[test]
+    fn test_config_from_env_custom_values() {
+        // Set custom values
+        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "32000");
+        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "5");
+
+        let config = Config::from_env().unwrap();
+
+        // Should use custom values
+        assert_eq!(config.max_output_tokens, 32000);
+        assert_eq!(config.max_truncation_retries, 5);
+
+        // Clean up
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+    }
+
+    #[test]
+    fn test_config_from_env_bounds_checking() {
+        // Test minimum bounds
+        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "500"); // Below min (1000)
+        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "0"); // Below min (1)
+
+        let config = Config::from_env().unwrap();
+
+        // Should enforce minimums
+        assert_eq!(config.max_output_tokens, 1000);
+        assert_eq!(config.max_truncation_retries, 1);
+
+        // Clean up
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+    }
+
+    #[test]
+    fn test_config_from_env_maximum_bounds() {
+        // Test maximum bounds
+        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "200000000"); // Above max (100M)
+        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "20"); // Above max (10)
+
+        let config = Config::from_env().unwrap();
+
+        // Should enforce maximums
+        assert_eq!(config.max_output_tokens, 100_000_000);
+        assert_eq!(config.max_truncation_retries, 10);
+
+        // Clean up
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+    }
+
+    #[test]
+    fn test_config_from_env_invalid_values() {
+        // Set invalid (non-numeric) values
+        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "invalid");
+        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "not_a_number");
+
+        let config = Config::from_env().unwrap();
+
+        // Should fall back to defaults
+        assert_eq!(config.max_output_tokens, 160000);
+        assert_eq!(config.max_truncation_retries, 3);
+
+        // Clean up
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
     }
 }

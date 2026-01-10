@@ -139,6 +139,8 @@ impl Drop for ThinkingAnimation {
 struct Config {
     model: String,
     workdir: PathBuf,
+    max_output_tokens: u32,
+    max_truncation_retries: usize,
 }
 
 impl Config {
@@ -149,7 +151,28 @@ impl Config {
             env::var("MODEL_NAME").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
         let workdir = env::current_dir().context("Failed to get current directory")?;
 
-        Ok(Self { model, workdir })
+        // Read MINI_CODE_MAX_OUTPUT_TOKENS from environment, default to 160000
+        let max_output_tokens = env::var("MINI_CODE_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(160000)
+            .max(1000) // Minimum 1000 tokens
+            .min(100_000_000); // Maximum 100M tokens (Claude's limit)
+
+        // Read max truncation retries, default to 3
+        let max_truncation_retries = env::var("MINI_CODE_MAX_TRUNCATION_RETRIES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(3)
+            .max(1) // At least 1 retry
+            .min(10); // Max 10 retries
+
+        Ok(Self {
+            model,
+            workdir,
+            max_output_tokens,
+            max_truncation_retries,
+        })
     }
 
     fn system_prompt(&self) -> String {
@@ -662,6 +685,79 @@ fn run_todo(todo_manager: &TodoManager, items: Vec<TodoItem>) -> String {
 }
 
 // =============================================================================
+// Subagent Progress Tracking
+// =============================================================================
+
+/// Shared state for subagent progress display
+struct SubagentProgress {
+    tool_count: usize,
+    current_tool: Option<String>,
+    start_time: Instant,
+}
+
+impl SubagentProgress {
+    fn new() -> Self {
+        Self {
+            tool_count: 0,
+            current_tool: None,
+            start_time: Instant::now(),
+        }
+    }
+}
+
+/// Spawn a background thread to update subagent progress display
+fn spawn_subagent_progress_updater(
+    agent_type: String,
+    description: String,
+    progress: Arc<Mutex<SubagentProgress>>,
+    stop_signal: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        // Save cursor position after the main line
+        print!("\n"); // Add a line for tool display
+        io::stdout().flush().ok();
+
+        while !stop_signal.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(1000)); // Update every second
+
+            if stop_signal.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let progress_guard = progress.lock().unwrap();
+            let elapsed = progress_guard.start_time.elapsed().as_secs_f64();
+            let tool_count = progress_guard.tool_count;
+            let current_tool = progress_guard.current_tool.clone();
+            drop(progress_guard);
+
+            // Move cursor up 1 line, clear it, and redraw the status line
+            print!(
+                "\x1B[1A\x1B[K  {} {} ... {} tools, {:.1}s\n",
+                format!("[{}]", agent_type).bright_magenta(),
+                description,
+                tool_count,
+                elapsed
+            );
+
+            // Draw the current tool line (or clear it if no tool)
+            if let Some(tool_info) = current_tool {
+                print!(
+                    "\x1B[K    {} {}\n",
+                    "→".bright_blue(),
+                    tool_info.bright_black()
+                );
+            } else {
+                print!("\x1B[K\n");
+            }
+
+            // Move cursor back up to the tool line
+            print!("\x1B[1A");
+            io::stdout().flush().ok();
+        }
+    })
+}
+
+// =============================================================================
 // Subagent Execution - The heart of v3
 // =============================================================================
 
@@ -709,13 +805,31 @@ Complete the task and return a clear, concise summary."#,
         content: vec![ContentBlock::text(prompt)],
     }];
 
-    // Progress tracking
-    println!("  {} {}", format!("[{}]", agent_type).bright_magenta(), description);
-    let start = Instant::now();
-    let mut tool_count = 0;
+    // Progress tracking with real-time updates
+    let progress = Arc::new(Mutex::new(SubagentProgress::new()));
+    let progress_clone = progress.clone();
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let stop_signal_clone = stop_signal.clone();
 
-    // Run the same agent loop (silently - don't print details to main chat)
-    loop {
+    // Print initial line
+    println!(
+        "  {} {}",
+        format!("[{}]", agent_type).bright_magenta(),
+        description
+    );
+
+    // Spawn background thread to update progress
+    let updater = spawn_subagent_progress_updater(
+        agent_type.to_string(),
+        description.to_string(),
+        progress_clone,
+        stop_signal_clone,
+    );
+
+    let mut consecutive_truncations = 0;
+
+    // Run the same agent loop (with real-time progress display)
+    let result = loop {
         let request = MessagesRequestBuilder::new(&config.model, sub_messages.clone(), 8000)
             .system(SystemPrompt::Text(sub_system.clone()))
             .tools(sub_tools.clone())
@@ -723,70 +837,179 @@ Complete the task and return a clear, concise summary."#,
 
         let request = match request {
             Ok(r) => r,
-            Err(e) => return format!("Error building request: {}", e),
+            Err(e) => break format!("Error building request: {}", e),
         };
 
         let response = match client.messages(request).await {
             Ok(r) => r,
-            Err(e) => return format!("Error calling API: {}", e),
+            Err(e) => break format!("Error calling API: {}", e),
         };
 
-        if response.stop_reason != Some(StopReason::ToolUse) {
-            // Extract final text
-            for block in &response.content {
-                if let ContentBlock::Text { text } = block {
-                    let elapsed = start.elapsed();
-                    println!(
-                        "  {} {} - done ({} tools, {:.1}s)",
-                        format!("[{}]", agent_type).bright_magenta(),
-                        description,
+        // Handle different stop reasons
+        match response.stop_reason {
+            Some(StopReason::MaxTokens) => {
+                consecutive_truncations += 1;
+
+                if consecutive_truncations >= 2 {
+                    let progress_guard = progress.lock().unwrap();
+                    let elapsed = progress_guard.start_time.elapsed();
+                    let tool_count = progress_guard.tool_count;
+                    drop(progress_guard);
+
+                    break format!(
+                        "[ERROR] Subagent output truncated {} times ({} tools, {:.1}s). Task too complex.",
+                        consecutive_truncations,
                         tool_count,
                         elapsed.as_secs_f64()
                     );
-                    return text.clone();
                 }
-            }
-            return "(subagent returned no text)".to_string();
-        }
 
-        // Execute tool calls
-        let mut results = Vec::new();
-        for block in &response.content {
-            if let ContentBlock::ToolUse { id, name, input } = block {
-                tool_count += 1;
-                let output = execute_tool(config, todo_manager, name, input);
-
-                results.push(ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
-                    is_error: None,
-                    content: anthropic::types::ToolResultContent::Text(output),
+                // Add truncation handling message
+                sub_messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.content,
                 });
 
-                // Update progress display (in-place)
-                let elapsed = start.elapsed();
-                print!(
-                    "\r  {} {} ... {} tools, {:.1}s",
-                    format!("[{}]", agent_type).bright_magenta(),
-                    description,
-                    tool_count,
-                    elapsed.as_secs_f64()
-                );
-                io::stdout().flush().ok();
+                sub_messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::text(
+                        "[SYSTEM: Response truncated. Provide a brief summary only (max 200 words).]"
+                    )],
+                });
+
+                continue;
+            }
+
+            Some(StopReason::ToolUse) => {
+                consecutive_truncations = 0; // Reset counter
+
+                // Execute tool calls
+                let mut results = Vec::new();
+                for block in &response.content {
+                    if let ContentBlock::ToolUse { id, name, input } = block {
+                        // Update progress: increment count and show current tool
+                        {
+                            let mut progress_guard = progress.lock().unwrap();
+                            progress_guard.tool_count += 1;
+
+                            // Format tool display based on type
+                            let tool_display = match name.as_str() {
+                                "bash" => {
+                                    if let Some(cmd) = input.get("command").and_then(|v| v.as_str())
+                                    {
+                                        let short_cmd = if cmd.len() > 60 {
+                                            format!("{}...", &cmd[..60])
+                                        } else {
+                                            cmd.to_string()
+                                        };
+                                        format!("bash: {}", short_cmd)
+                                    } else {
+                                        "bash".to_string()
+                                    }
+                                }
+                                "read_file" => {
+                                    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                                        format!("read: {}", path)
+                                    } else {
+                                        "read_file".to_string()
+                                    }
+                                }
+                                "write_file" => {
+                                    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                                        format!("write: {}", path)
+                                    } else {
+                                        "write_file".to_string()
+                                    }
+                                }
+                                "edit_file" => {
+                                    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                                        format!("edit: {}", path)
+                                    } else {
+                                        "edit_file".to_string()
+                                    }
+                                }
+                                other => other.to_string(),
+                            };
+
+                            progress_guard.current_tool = Some(tool_display);
+                        }
+
+                        let output = execute_tool(config, todo_manager, name, input);
+
+                        results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            is_error: None,
+                            content: anthropic::types::ToolResultContent::Text(output),
+                        });
+
+                        // Clear current tool after execution
+                        {
+                            let mut progress_guard = progress.lock().unwrap();
+                            progress_guard.current_tool = None;
+                        }
+                    }
+                }
+
+                sub_messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.content,
+                });
+                sub_messages.push(Message {
+                    role: Role::User,
+                    content: results,
+                });
+            }
+
+            Some(StopReason::EndTurn) | Some(StopReason::StopSequence) | None => {
+                consecutive_truncations = 0; // Reset counter
+
+                // Extract final text and return
+                let mut text_result = None;
+                for block in &response.content {
+                    if let ContentBlock::Text { text } = block {
+                        text_result = Some(text.clone());
+                        break;
+                    }
+                }
+                break text_result.unwrap_or_else(|| "(subagent returned no text)".to_string());
             }
         }
+    };
 
-        print!("\r"); // Clear the progress line
-        io::stdout().flush().ok();
+    // Stop the updater thread
+    stop_signal.store(true, Ordering::Relaxed);
+    updater.join().ok(); // Wait for the thread to finish
 
-        sub_messages.push(Message {
-            role: Role::Assistant,
-            content: response.content,
-        });
-        sub_messages.push(Message {
-            role: Role::User,
-            content: results,
-        });
+    // Clear the progress lines and show final result
+    let progress_guard = progress.lock().unwrap();
+    let elapsed = progress_guard.start_time.elapsed();
+    let tool_count = progress_guard.tool_count;
+    drop(progress_guard);
+
+    // Move up, clear both lines, and print final status
+    print!("\x1B[1A\x1B[K\x1B[1A\x1B[K");
+
+    if result.starts_with("[ERROR]") {
+        println!(
+            "  {} {} - {} ({} tools, {:.1}s)",
+            format!("[{}]", agent_type).bright_red(),
+            description,
+            "ERROR".bright_red(),
+            tool_count,
+            elapsed.as_secs_f64()
+        );
+    } else {
+        println!(
+            "  {} {} - {} ({} tools, {:.1}s)",
+            format!("[{}]", agent_type).bright_magenta(),
+            description,
+            "done".bright_green(),
+            tool_count,
+            elapsed.as_secs_f64()
+        );
     }
+
+    result
 }
 
 fn execute_tool(
@@ -864,19 +1087,63 @@ async fn execute_tool_async(
             .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("subtask");
-        let prompt = input
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
         let agent_type = input
             .get("agent_type")
             .and_then(|v| v.as_str())
             .unwrap_or("explore");
 
-        run_task(client, config, todo_manager, description, prompt, agent_type).await
+        run_task(
+            client,
+            config,
+            todo_manager,
+            description,
+            prompt,
+            agent_type,
+        )
+        .await
     } else {
         execute_tool(config, todo_manager, name, input)
     }
+}
+
+// =============================================================================
+// Token Management Helpers
+// =============================================================================
+
+/// Estimate the number of tokens in the message history (rough approximation)
+fn estimate_context_tokens(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|msg| {
+            msg.content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Text { text } => text.len() / 4, // Rough: 4 chars ≈ 1 token
+                    ContentBlock::ToolUse { input, .. } => {
+                        serde_json::to_string(input).unwrap_or_default().len() / 4
+                    }
+                    ContentBlock::ToolResult { content, .. } => match content {
+                        anthropic::types::ToolResultContent::Text(t) => t.len() / 4,
+                        _ => 100, // Default estimate
+                    },
+                    _ => 0,
+                })
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+/// Calculate appropriate max_tokens based on context length and config
+fn calculate_max_tokens(context_tokens: usize, max_configured: u32) -> u32 {
+    const MAX_CONTEXT: usize = 200000; // Claude's context window
+    const OUTPUT_RATIO: f64 = 0.4; // Use 40% of remaining space for output
+
+    let available = MAX_CONTEXT.saturating_sub(context_tokens);
+    let max_output = (available as f64 * OUTPUT_RATIO) as u32;
+
+    // Keep within reasonable bounds and configured maximum
+    max_output.max(4000).min(max_configured)
 }
 
 // =============================================================================
@@ -890,9 +1157,14 @@ async fn agent_loop(
     messages: &mut Vec<Message>,
 ) -> Result<()> {
     let tools = create_all_tools();
+    let mut consecutive_truncations = 0;
 
     loop {
-        let request = MessagesRequestBuilder::new(&config.model, messages.clone(), 8000)
+        // Calculate dynamic max_tokens based on context and config
+        let context_tokens = estimate_context_tokens(messages);
+        let max_output = calculate_max_tokens(context_tokens, config.max_output_tokens);
+
+        let request = MessagesRequestBuilder::new(&config.model, messages.clone(), max_output)
             .system(SystemPrompt::Text(config.system_prompt()))
             .tools(tools.clone())
             .build()?;
@@ -928,85 +1200,172 @@ async fn agent_loop(
         println!(
             "{}",
             format!(
-                "in: {} out: {} {:.1}s",
+                "in: {} out: {} max: {} {:.1}s",
                 usage.input_tokens,
                 usage.output_tokens,
+                max_output,
                 elapsed.as_secs_f64()
             )
             .bright_black()
         );
 
-        let mut tool_calls = Vec::new();
-        for block in &response.content {
-            match block {
-                ContentBlock::Text { text } => {
-                    if !text.trim().is_empty() {
-                        println!("{}", text);
+        // Handle different stop reasons
+        match response.stop_reason {
+            Some(StopReason::MaxTokens) => {
+                consecutive_truncations += 1;
+
+                if consecutive_truncations >= config.max_truncation_retries {
+                    eprintln!(
+                        "\n{}",
+                        format!(
+                            "Error: Response truncated {} times in a row. Task may be too complex.",
+                            consecutive_truncations
+                        )
+                        .bright_red()
+                    );
+                    eprintln!(
+                        "{}",
+                        "Hint: Break the task into smaller steps, or write large outputs to files using write_file."
+                            .bright_yellow()
+                    );
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "You can also increase MINI_CODE_MAX_OUTPUT_TOKENS (current: {})",
+                            config.max_output_tokens
+                        )
+                        .bright_yellow()
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Task too complex, please break it into smaller steps"
+                    ));
+                }
+
+                eprintln!(
+                    "\n{}",
+                    format!(
+                        "Warning: Response truncated (attempt {}/{}). Asking model to provide a summary...",
+                        consecutive_truncations,
+                        config.max_truncation_retries
+                    )
+                    .bright_yellow()
+                );
+
+                // Extract and display any text output
+                for block in &response.content {
+                    if let ContentBlock::Text { text } = block {
+                        if !text.trim().is_empty() {
+                            println!("{}", text);
+                        }
                     }
                 }
-                ContentBlock::ToolUse { id, name, input } => {
-                    tool_calls.push((id.clone(), name.clone(), input.clone()));
+
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.content,
+                });
+
+                messages.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::text(
+                        "[SYSTEM: Your previous response was truncated due to length. Please provide a brief summary, or write large content to a file using write_file tool.]"
+                    )],
+                });
+
+                continue; // Continue loop to get summary
+            }
+
+            Some(StopReason::ToolUse) => {
+                consecutive_truncations = 0; // Reset counter
+
+                // Normal tool use - extract tool calls
+                let mut tool_calls = Vec::new();
+                for block in &response.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            if !text.trim().is_empty() {
+                                println!("{}", text);
+                            }
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            tool_calls.push((id.clone(), name.clone(), input.clone()));
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
+
+                // Execute tools and continue loop
+                let mut results = Vec::new();
+
+                for (id, name, input) in tool_calls {
+                    // Display tool call
+                    let tool_display = match name.as_str() {
+                        "Task" => format!("{} {}", ">".bright_blue(), name.bright_magenta()),
+                        "TodoWrite" => format!("{} {}", ">".bright_blue(), name.bright_magenta()),
+                        "bash" => format!("{} {}", ">".bright_blue(), name.bright_yellow()),
+                        _ => format!("{} {}", ">".bright_blue(), name.bright_cyan()),
+                    };
+                    println!("\n{}", tool_display);
+
+                    let output =
+                        execute_tool_async(client, config, todo_manager, &name, &input).await;
+
+                    // Display output
+                    let preview = if name == "TodoWrite" || name == "Task" {
+                        output.clone()
+                    } else if output.len() > 300 {
+                        format!("{}...", safe_truncate(&output, 300))
+                    } else {
+                        output.clone()
+                    };
+
+                    if output.starts_with("Error:") {
+                        println!("{}", preview.bright_red());
+                    } else if name == "TodoWrite" {
+                        println!("{}", preview.bright_green());
+                    } else if name == "Task" {
+                        // Task output already printed by run_task
+                    } else {
+                        println!("  {}", preview.bright_black());
+                    }
+
+                    results.push(ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        is_error: None,
+                        content: anthropic::types::ToolResultContent::Text(output),
+                    });
+                }
+
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.content,
+                });
+                messages.push(Message {
+                    role: Role::User,
+                    content: results,
+                });
+            }
+
+            Some(StopReason::EndTurn) | Some(StopReason::StopSequence) | None => {
+                consecutive_truncations = 0; // Reset counter
+
+                // Normal end - display text and return
+                for block in &response.content {
+                    if let ContentBlock::Text { text } = block {
+                        if !text.trim().is_empty() {
+                            println!("{}", text);
+                        }
+                    }
+                }
+
+                messages.push(Message {
+                    role: Role::Assistant,
+                    content: response.content,
+                });
+
+                return Ok(());
             }
         }
-
-        if response.stop_reason != Some(StopReason::ToolUse) {
-            messages.push(Message {
-                role: Role::Assistant,
-                content: response.content,
-            });
-            return Ok(());
-        }
-
-        let mut results = Vec::new();
-
-        for (id, name, input) in tool_calls {
-            // Display tool call
-            let tool_display = match name.as_str() {
-                "Task" => format!("{} {}", ">".bright_blue(), name.bright_magenta()),
-                "TodoWrite" => format!("{} {}", ">".bright_blue(), name.bright_magenta()),
-                "bash" => format!("{} {}", ">".bright_blue(), name.bright_yellow()),
-                _ => format!("{} {}", ">".bright_blue(), name.bright_cyan()),
-            };
-            println!("\n{}", tool_display);
-
-            let output = execute_tool_async(client, config, todo_manager, &name, &input).await;
-
-            // Display output
-            let preview = if name == "TodoWrite" || name == "Task" {
-                output.clone()
-            } else if output.len() > 300 {
-                format!("{}...", safe_truncate(&output, 300))
-            } else {
-                output.clone()
-            };
-
-            if output.starts_with("Error:") {
-                println!("{}", preview.bright_red());
-            } else if name == "TodoWrite" {
-                println!("{}", preview.bright_green());
-            } else if name == "Task" {
-                // Task output already printed by run_task
-            } else {
-                println!("  {}", preview.bright_black());
-            }
-
-            results.push(ContentBlock::ToolResult {
-                tool_use_id: id,
-                is_error: None,
-                content: anthropic::types::ToolResultContent::Text(output),
-            });
-        }
-
-        messages.push(Message {
-            role: Role::Assistant,
-            content: response.content,
-        });
-        messages.push(Message {
-            role: Role::User,
-            content: results,
-        });
     }
 }
 
@@ -1093,8 +1452,15 @@ async fn main() -> Result<()> {
     );
     println!(
         "{}",
-        format!("Agent types: {}", get_agent_types().keys().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
-            .bright_black()
+        format!(
+            "Agent types: {}",
+            get_agent_types()
+                .keys()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .bright_black()
     );
     println!("{}\n", "Type 'exit' to quit.".bright_black());
 
@@ -1134,4 +1500,306 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_safe_truncate_short_string() {
+        let s = "Hello, World!";
+        assert_eq!(safe_truncate(s, 100), "Hello, World!");
+    }
+
+    #[test]
+    fn test_safe_truncate_utf8() {
+        let s = "你好世界abc";
+        let truncated = safe_truncate(s, 13);
+        assert_eq!(truncated, "你好世界a");
+        assert!(truncated.len() <= 13);
+    }
+
+    #[test]
+    fn test_todo_manager_new() {
+        let manager = TodoManager::new();
+        let rendered = manager.render();
+        assert_eq!(rendered, "No todos.");
+    }
+
+    #[test]
+    fn test_todo_manager_update() {
+        let manager = TodoManager::new();
+        let items = vec![TodoItem {
+            content: "Test task".to_string(),
+            status: TodoStatus::Pending,
+            active_form: "Testing".to_string(),
+        }];
+        let result = manager.update(items);
+        assert!(result.is_ok());
+        let rendered = manager.render();
+        assert!(rendered.contains("[ ] Test task"));
+    }
+
+    #[test]
+    fn test_create_base_tools_count() {
+        let tools = create_base_tools();
+        assert_eq!(
+            tools.len(),
+            5,
+            "Should have 5 base tools (4 from v1 + TodoWrite)"
+        );
+    }
+
+    #[test]
+    fn test_create_all_tools_count() {
+        let tools = create_all_tools();
+        assert_eq!(tools.len(), 6, "Should have 6 tools (5 base + Task)");
+    }
+
+    #[test]
+    fn test_create_all_tools_names() {
+        let tools = create_all_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"TodoWrite"));
+        assert!(names.contains(&"Task"));
+    }
+
+    #[test]
+    fn test_get_agent_types() {
+        let types = get_agent_types();
+        assert!(types.contains_key("explore"));
+        assert!(types.contains_key("code"));
+        assert!(types.contains_key("plan"));
+        assert_eq!(types.len(), 3);
+    }
+
+    #[test]
+    fn test_get_tools_for_agent_explore() {
+        let tools = get_tools_for_agent("explore");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        // Explore should only have bash and read_file
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"read_file"));
+        assert!(!names.contains(&"write_file"));
+        assert!(!names.contains(&"edit_file"));
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn test_get_tools_for_agent_code() {
+        let tools = get_tools_for_agent("code");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        // Code agent should have all base tools
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"TodoWrite"));
+        assert_eq!(tools.len(), 5);
+    }
+
+    #[test]
+    fn test_get_tools_for_agent_plan() {
+        let tools = get_tools_for_agent("plan");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        // Plan should only have bash and read_file
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"read_file"));
+        assert!(!names.contains(&"write_file"));
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn test_run_bash_simple() {
+        let workdir = std::env::current_dir().unwrap();
+        let output = run_bash(&workdir, "echo 'test'");
+        assert!(output.contains("test"));
+    }
+
+    #[test]
+    fn test_run_bash_dangerous_blocked() {
+        let workdir = std::env::current_dir().unwrap();
+        let output = run_bash(&workdir, "rm -rf /");
+        assert!(output.contains("Dangerous command blocked"));
+    }
+
+    #[test]
+    fn test_safe_path_valid() {
+        let workdir = std::env::temp_dir();
+        let result = safe_path(&workdir, "test.txt");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_safe_path_escape_attempt() {
+        let workdir = std::env::temp_dir();
+        let result = safe_path(&workdir, "../../../etc/passwd");
+        assert!(result.is_err());
+    }
+
+    // =============================================================================
+    // Token Management Tests (NEW - for crash fix)
+    // =============================================================================
+    //
+    // NOTE: Environment variable tests (test_config_from_env_*) modify process-wide
+    // state and may interfere with each other when run in parallel. To ensure all
+    // tests pass reliably, run with: cargo test -- --test-threads=1
+    //
+    // This is a known limitation of testing code that depends on environment variables.
+
+    #[test]
+    fn test_estimate_context_tokens_empty() {
+        let messages: Vec<Message> = vec![];
+        let tokens = estimate_context_tokens(&messages);
+        assert_eq!(tokens, 0);
+    }
+
+    #[test]
+    fn test_estimate_context_tokens_text() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::text("Hello World")],
+        }];
+        let tokens = estimate_context_tokens(&messages);
+        assert!(tokens >= 2 && tokens <= 3);
+    }
+
+    #[test]
+    fn test_estimate_context_tokens_multiple_messages() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::text("A".repeat(400))],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::text("B".repeat(400))],
+            },
+        ];
+        let tokens = estimate_context_tokens(&messages);
+        assert!(tokens >= 195 && tokens <= 205);
+    }
+
+    #[test]
+    fn test_calculate_max_tokens_basic() {
+        let context_tokens = 1000;
+        let max_configured = 160000;
+        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
+
+        // With 1000 context tokens:
+        // Available: 200000 - 1000 = 199000
+        // Output: 199000 * 0.4 = 79600
+        // Should be 79600 (less than max_configured)
+        assert_eq!(max_tokens, 79600);
+    }
+
+    #[test]
+    fn test_calculate_max_tokens_respects_minimum() {
+        let context_tokens = 198000;
+        let max_configured = 160000;
+        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
+
+        // Should be increased to minimum 4000
+        assert_eq!(max_tokens, 4000);
+    }
+
+    #[test]
+    fn test_calculate_max_tokens_respects_configured_max() {
+        let context_tokens = 1000;
+        let max_configured = 8000;
+        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
+
+        assert_eq!(max_tokens, 8000);
+    }
+
+    #[test]
+    fn test_calculate_max_tokens_high_configured() {
+        let context_tokens = 50000;
+        let max_configured = 100000;
+        let max_tokens = calculate_max_tokens(context_tokens, max_configured);
+
+        // With 50000 context: 150000 available * 0.4 = 60000
+        assert_eq!(max_tokens, 60000);
+    }
+
+    #[test]
+    fn test_config_from_env_defaults() {
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+
+        let config = Config::from_env().unwrap();
+
+        // v3 defaults differ from v2
+        assert_eq!(config.max_output_tokens, 160000);
+        assert_eq!(config.max_truncation_retries, 3);
+    }
+
+    #[test]
+    fn test_config_from_env_custom_values() {
+        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "32000");
+        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "5");
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.max_output_tokens, 32000);
+        assert_eq!(config.max_truncation_retries, 5);
+
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+    }
+
+    #[test]
+    fn test_config_from_env_bounds_checking() {
+        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "500");
+        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "0");
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.max_output_tokens, 1000);
+        assert_eq!(config.max_truncation_retries, 1);
+
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+    }
+
+    #[test]
+    fn test_config_from_env_maximum_bounds() {
+        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "200000000");
+        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "20");
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.max_output_tokens, 100_000_000);
+        assert_eq!(config.max_truncation_retries, 10);
+
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+    }
+
+    #[test]
+    fn test_config_from_env_invalid_values() {
+        std::env::set_var("MINI_CODE_MAX_OUTPUT_TOKENS", "invalid");
+        std::env::set_var("MINI_CODE_MAX_TRUNCATION_RETRIES", "not_a_number");
+
+        let config = Config::from_env().unwrap();
+
+        // Should fall back to v3 defaults
+        assert_eq!(config.max_output_tokens, 160000);
+        assert_eq!(config.max_truncation_retries, 3);
+
+        std::env::remove_var("MINI_CODE_MAX_OUTPUT_TOKENS");
+        std::env::remove_var("MINI_CODE_MAX_TRUNCATION_RETRIES");
+    }
 }
