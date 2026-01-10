@@ -1772,6 +1772,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "v3_subagent"
+version = "0.1.0"
+dependencies = [
+ "anthropic",
+ "anyhow",
+ "colored",
+ "dotenvy",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

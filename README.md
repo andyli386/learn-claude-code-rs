@@ -4,11 +4,12 @@
 
 ## 项目概览
 
-这是一个 Rust workspace 项目，包含三个独立的 crate，代表编码代理的三个演进阶段：
+这是一个 Rust workspace 项目，包含四个独立的 crate，代表编码代理的四个演进阶段：
 
 - **v0_bash_agent**: 极简代理 - 仅使用 bash 工具
 - **v1_basic_agent**: 基础代理 - 添加 4 个核心工具
 - **v2_todo_agent**: 高级代理 - 增加任务规划和可见性
+- **v3_subagent**: 子代理机制 - 通过上下文隔离解决复杂任务
 
 每个版本都是完全可用的，展示了从简单到复杂的设计演进。
 
@@ -38,13 +39,13 @@
 
 ## 版本对比
 
-| 特性 | v0_bash_agent | v1_basic_agent | v2_todo_agent |
-|------|--------------|----------------|---------------|
-| 工具数量 | 1 (bash) | 4 (bash + 文件操作) | 5 (增加 TodoWrite) |
-| 代码行数 | ~200 行 | ~500 行 | ~800 行 |
-| 子代理支持 | ✅ 进程级隔离 | ❌ | ❌ |
-| 任务规划 | ❌ | ❌ | ✅ 可见任务列表 |
-| 适用场景 | 快速原型、单步任务 | 日常编码 | 复杂重构、多步骤任务 |
+| 特性 | v0_bash_agent | v1_basic_agent | v2_todo_agent | v3_subagent |
+|------|--------------|----------------|---------------|-------------|
+| 工具数量 | 1 (bash) | 4 (bash + 文件操作) | 5 (增加 TodoWrite) | 6 (增加 Task) |
+| 代码行数 | ~200 行 | ~500 行 | ~800 行 | ~900 行 |
+| 子代理支持 | ✅ 进程级隔离 | ❌ | ❌ | ✅ 上下文隔离 |
+| 任务规划 | ❌ | ❌ | ✅ 可见任务列表 | ✅ 可见任务列表 |
+| 适用场景 | 快速原型、单步任务 | 日常编码 | 复杂重构、多步骤任务 | 超大型任务、探索+实现 |
 
 ## 快速开始
 
@@ -96,6 +97,16 @@ cargo run --bin v2_todo_agent
 
 # 不使用 readline
 cargo run --bin v2_todo_agent --no-default-features
+```
+
+#### v3 - 子代理机制（超大型任务）
+
+```bash
+# 运行（默认启用 readline 支持）
+cargo run -p v3_subagent
+
+# 不使用 readline
+cargo run -p v3_subagent --no-default-features
 ```
 
 ## 版本详解
@@ -211,6 +222,57 @@ cargo run --bin v2_todo_agent --no-default-features
 - 想要看到代理的思考过程
 - 长时间运行的任务
 
+### v3: 上下文隔离
+
+**核心哲学**: "分而治之" - 通过子代理隔离上下文，解决大型任务的上下文污染问题。
+
+**新增内容**:
+- Task 工具：生成具有隔离上下文的子代理
+- Agent 类型注册表：explore, code, plan
+- 工具过滤：根据代理类型限制可用工具
+- 进度追踪：实时显示子代理执行状态
+
+**代理类型**:
+
+| 类型 | 工具 | 用途 |
+|------|------|------|
+| explore | bash, read_file | 只读探索和分析 |
+| code | 所有工具 | 完整的实现和修改 |
+| plan | bash, read_file | 设计规划，不修改 |
+
+**工作流程示例**:
+
+```
+用户: 重构 auth 模块以使用 JWT
+
+主代理:
+  > Task(explore): "查找所有 auth 相关文件"
+    [explore] 5 个工具, 3.2s
+    -> 返回: "Auth 在 src/auth/login.rs..."
+
+  > Task(plan): "设计 JWT 迁移"
+    [plan] 3 个工具, 1.8s
+    -> 返回: "1. 添加 jwt 库 2. 创建 utils..."
+
+  > Task(code): "实现 JWT"
+    [code] 8 个工具, 5.4s
+    -> 返回: "已创建 jwt_utils.rs..."
+
+  完成！
+```
+
+**关键优势**:
+- **上下文隔离**: 子代理在独立上下文中运行，不污染主对话
+- **工具限制**: explore 和 plan 类型不能修改文件
+- **并行可能**: 可以同时运行多个子代理（未来）
+- **自然分解**: 大任务自然分解为小任务
+
+**何时使用**:
+- 超大型任务（探索 → 规划 → 实现）
+- 需要先探索再修改的场景
+- 多阶段的复杂重构
+- 需要保持主对话清晰的任务
+
 ## 架构设计
 
 ### 工作空间结构
@@ -229,10 +291,15 @@ mini-code/
 │   │   ├── src/
 │   │   │   └── main.rs       # 完整实现 + 测试
 │   │   └── Cargo.toml
-│   └── v2_todo_agent/        # 高级版本
+│   ├── v2_todo_agent/        # 高级版本
+│   │   ├── src/
+│   │   │   └── main.rs       # 完整实现 + 测试
+│   │   └── Cargo.toml
+│   └── v3_subagent/          # 子代理版本
 │       ├── src/
-│       │   └── main.rs       # 完整实现 + 测试
-│       └── Cargo.toml
+│       │   └── main.rs       # 完整实现 + 子代理支持
+│       ├── Cargo.toml
+│       └── README.md         # 详细文档
 ├── .env.example              # 环境变量模板
 └── README.md
 ```
@@ -335,6 +402,7 @@ cargo test
 cargo test -p v0_bash_agent
 cargo test -p v1_basic_agent
 cargo test -p v2_todo_agent
+cargo test -p v3_subagent
 
 # 使用 nextest（更快）
 cargo nextest run
@@ -345,6 +413,7 @@ cargo nextest run
 - **v0**: bash 命令执行、系统提示生成
 - **v1**: UTF-8 截断、路径安全、工具创建
 - **v2**: TodoManager 验证、约束执行、完整工作流
+- **v3**: Agent 类型注册、工具过滤、子代理隔离
 
 ## 使用示例
 
@@ -388,6 +457,27 @@ TodoWrite: [
 > read_file src/auth.rs
 > write_file src/auth_test.rs ...
 > (继续执行)
+```
+
+### 示例 4: 大型重构 (v3)
+
+```
+你: 重构整个认证系统，先探索再设计再实现
+
+代理:
+> Task
+  [explore] 查找所有认证相关文件 ... 6 tools, 4.2s
+  -> 返回: "认证代码分布在 src/auth/、src/middleware/、tests/auth/"
+
+> Task
+  [plan] 设计重构策略 ... 4 tools, 2.1s
+  -> 返回: "1. 统一到 auth/ 2. 抽象接口 3. 添加测试"
+
+> Task
+  [code] 实现重构 ... 12 tools, 8.5s
+  -> 返回: "已创建 auth/mod.rs，已迁移所有代码"
+
+完成！认证系统已重构。
 ```
 
 ## 性能考虑
@@ -442,6 +532,8 @@ cargo run --bin v2_todo_agent --features readline
 4. **比较 v0 和 v1**: 看看 4 个工具如何改变体验
 5. **运行 v2**: 尝试复杂任务
 6. **阅读 v2 代码**: 理解 TodoWrite 如何实现可见规划
+7. **运行 v3**: 体验子代理的上下文隔离
+8. **阅读 v3 代码**: 理解 Task 工具如何实现子代理机制
 
 ## 贡献
 
@@ -484,6 +576,7 @@ A: 取决于你的需求：
 - 简单脚本和快速任务 → v0
 - 日常编码 → v1
 - 复杂项目重构 → v2
+- 超大型任务，需要探索和实现分离 → v3
 
 ### Q: 可以添加自己的工具吗？
 
@@ -504,6 +597,7 @@ A: 所有版本都会打印工具调用和结果。查看输出中的 `> tool_na
 1. **v0**: 证明最小可行性（1 个工具）
 2. **v1**: 添加实用工具（4 个工具）
 3. **v2**: 增加规划能力（5 个工具 + 可见性）
+4. **v3**: 上下文隔离（6 个工具 + 子代理）
 
 关键洞察：代理的复杂性来自工具，而非模型。模型本身就是决策引擎。
 

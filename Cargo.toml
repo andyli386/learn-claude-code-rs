@@ -9,6 +9,7 @@ members = [
     "crates/v0_bash_agent",
     "crates/v1_basic_agent",
     "crates/v2_todo_agent",
+    "crates/v3_subagent",
 ]
 resolver = "2"
 
