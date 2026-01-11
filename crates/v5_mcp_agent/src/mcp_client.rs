@@ -269,6 +269,7 @@ fn extract_result_text(response: &Value) -> Result<String> {
 }
 
 /// Create browser automation tools for Claude
+#[allow(dead_code)]
 pub fn create_browser_tools() -> Vec<Value> {
     vec![
         json!({

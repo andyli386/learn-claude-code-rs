@@ -117,7 +117,7 @@ fn spawn_thinking_animation() -> ThinkingAnimation {
     let running_clone = running.clone();
 
     let handle = thread::spawn(move || {
-        let frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let mut idx = 0;
 
         print!("\x1B[?25l");
@@ -594,7 +594,7 @@ fn parse_search_html(html: &str, max_results: usize) -> Vec<SearchResult> {
         }
 
         // Find the end of the encoded URL
-        if let Some(end) = segment.find(|c| c == '&' || c == '"' || c == '\'') {
+        if let Some(end) = segment.find(['&', '"', '\'']) {
             let encoded_url = &segment[..end];
             if let Ok(url) = urlencoding::decode(encoded_url) {
                 let url_str = url.to_string();
@@ -1220,6 +1220,22 @@ fn run_browser_snapshot(mcp_client: &Arc<Mutex<McpBrowserClient>>) -> String {
     }
 }
 
+fn run_browser_get_network(mcp_client: &Arc<Mutex<McpBrowserClient>>) -> String {
+    let client = mcp_client.lock().unwrap();
+    match client.get_network() {
+        Ok(result) => result,
+        Err(e) => format!("Error getting network requests: {}", e),
+    }
+}
+
+fn run_browser_click(mcp_client: &Arc<Mutex<McpBrowserClient>>, uid: &str) -> String {
+    let client = mcp_client.lock().unwrap();
+    match client.click(uid) {
+        Ok(result) => result,
+        Err(e) => format!("Error clicking element {}: {}", uid, e),
+    }
+}
+
 // =============================================================================
 // Subagent Progress Tracking (from v3)
 // =============================================================================
@@ -1291,6 +1307,7 @@ fn spawn_subagent_progress_updater(
 // Subagent Execution (from v3, adapted for v4)
 // =============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn run_task(
     client: &Client,
     config: &Config,
@@ -1626,6 +1643,14 @@ fn execute_tool(
         "browser_screenshot" => run_browser_screenshot(mcp_client),
         "browser_get_performance" => run_browser_get_performance(mcp_client),
         "browser_snapshot" => run_browser_snapshot(mcp_client),
+        "browser_get_network" => run_browser_get_network(mcp_client),
+        "browser_click" => {
+            if let Some(uid) = input.get("uid").and_then(|v| v.as_str()) {
+                run_browser_click(mcp_client, uid)
+            } else {
+                "Error: Missing 'uid' parameter".to_string()
+            }
+        }
         _ => format!("Unknown tool: {}", name),
     }
 }

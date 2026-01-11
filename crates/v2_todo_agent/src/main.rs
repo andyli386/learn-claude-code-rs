@@ -85,7 +85,7 @@ fn spawn_thinking_animation() -> ThinkingAnimation {
     let running_clone = running.clone();
 
     let handle = thread::spawn(move || {
-        let frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let mut idx = 0;
 
         // Hide cursor
