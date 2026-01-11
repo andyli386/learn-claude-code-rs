@@ -2047,6 +2047,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "v5_mcp_agent"
+version = "0.1.0"
+dependencies = [
+ "anthropic",
+ "anyhow",
+ "colored",
+ "dotenvy",
+ "regex",
+ "reqwest 0.12.28",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "tokio",
+ "urlencoding",
+]
+
+[[package]]
 name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

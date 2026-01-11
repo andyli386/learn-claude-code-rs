@@ -1,0 +1,25 @@
+[package]
+name = "v5_mcp_agent"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "v5_mcp_agent"
+path = "src/main.rs"
+
+[dependencies]
+anthropic.workspace = true
+anyhow.workspace = true
+colored.workspace = true
+dotenvy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+regex = "1.11"
+rustyline = { workspace = true, optional = true }
+reqwest = { version = "0.12", features = ["json"] }
+urlencoding = "2.1"
+
+[features]
+default = ["readline"]
+readline = ["rustyline"]
