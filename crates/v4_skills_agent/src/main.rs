@@ -83,7 +83,7 @@ use colored::Colorize;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -541,6 +541,156 @@ impl TodoManager {
 }
 
 // =============================================================================
+// Web Search Tool (from ai-research-agent)
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+/// Perform web search using DuckDuckGo HTML scraping.
+async fn web_search(query: &str, max_results: usize) -> Result<Vec<SearchResult>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()?;
+
+    let url = format!(
+        "https://html.duckduckgo.com/html/?q={}",
+        urlencoding::encode(query)
+    );
+
+    // Add small delay to avoid rate limiting
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let response = client.get(&url).send().await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Search failed with status: {}", response.status());
+    }
+
+    let body = response.text().await?;
+    let results = parse_search_html(&body, max_results);
+
+    Ok(results)
+}
+
+/// Parse DuckDuckGo HTML to extract search results.
+fn parse_search_html(html: &str, max_results: usize) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    let mut seen_urls = HashSet::new();
+
+    // Strategy 1: Look for result links with the uddg parameter (redirect URLs)
+    for segment in html.split("uddg=") {
+        if results.len() >= max_results {
+            break;
+        }
+
+        // Find the end of the encoded URL
+        if let Some(end) = segment.find(|c| c == '&' || c == '"' || c == '\'') {
+            let encoded_url = &segment[..end];
+            if let Ok(url) = urlencoding::decode(encoded_url) {
+                let url_str = url.to_string();
+                if url_str.starts_with("http")
+                    && !url_str.contains("duckduckgo.com")
+                    && !seen_urls.contains(&url_str)
+                {
+                    seen_urls.insert(url_str.clone());
+                    results.push(SearchResult {
+                        title: extract_domain(&url_str).unwrap_or_else(|| "Result".to_string()),
+                        url: url_str,
+                        snippet: "Search result from DuckDuckGo".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Look for result__url class which contains visible URLs
+    if results.len() < max_results {
+        for segment in html.split("result__url") {
+            if results.len() >= max_results {
+                break;
+            }
+
+            // Look for href after this marker
+            if let Some(href_start) = segment.find("href=\"") {
+                let after_href = &segment[href_start + 6..];
+                if let Some(href_end) = after_href.find('"') {
+                    let href = &after_href[..href_end];
+                    let url = if href.starts_with("//") {
+                        format!("https:{}", href)
+                    } else if href.starts_with("http") {
+                        href.to_string()
+                    } else {
+                        continue;
+                    };
+
+                    if !url.contains("duckduckgo.com") && !seen_urls.contains(&url) {
+                        seen_urls.insert(url.clone());
+                        results.push(SearchResult {
+                            title: extract_domain(&url).unwrap_or_else(|| "Result".to_string()),
+                            url,
+                            snippet: "Search result".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy 3: Direct URL extraction - find any https:// URLs
+    if results.len() < max_results {
+        for segment in html.split("https://") {
+            if results.len() >= max_results {
+                break;
+            }
+
+            if let Some(end) = segment.find(|c: char| {
+                c == '"' || c == '\'' || c == '<' || c == '>' || c == ' ' || c == ')'
+            }) {
+                let domain_path = &segment[..end];
+                // Filter out internal/tracking URLs
+                if !domain_path.starts_with("duckduckgo")
+                    && !domain_path.starts_with("improving.duckduckgo")
+                    && !domain_path.contains("cdn.")
+                    && !domain_path.contains(".js")
+                    && !domain_path.contains(".css")
+                    && !domain_path.contains(".png")
+                    && !domain_path.contains(".ico")
+                    && domain_path.contains('.')
+                    && domain_path.len() > 5
+                {
+                    let url = format!("https://{}", domain_path);
+                    if !seen_urls.contains(&url) {
+                        seen_urls.insert(url.clone());
+                        results.push(SearchResult {
+                            title: extract_domain(&url).unwrap_or_else(|| "Result".to_string()),
+                            url,
+                            snippet: "Search result".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    results.into_iter().take(max_results).collect()
+}
+
+/// Extract the domain name from a URL.
+fn extract_domain(url: &str) -> Option<String> {
+    url.split("//")
+        .nth(1)?
+        .split('/')
+        .next()
+        .map(|s| s.to_string())
+}
+
+// =============================================================================
 // Tool Definitions
 // =============================================================================
 
@@ -616,6 +766,26 @@ fn create_base_tools() -> Vec<Tool> {
                     }
                 },
                 "required": ["path", "old_text", "new_text"]
+            }),
+        },
+        Tool {
+            name: "web_search".to_string(),
+            description: "Search the web using DuckDuckGo. Use this to find current information about any topic.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query to find information about"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 5)",
+                        "minimum": 1,
+                        "maximum": 10
+                    }
+                },
+                "required": ["query"]
             }),
         },
         Tool {
@@ -1188,6 +1358,19 @@ Complete the task and return a clear, concise summary."#,
                                         "edit_file".to_string()
                                     }
                                 }
+                                "web_search" => {
+                                    if let Some(query) = input.get("query").and_then(|v| v.as_str())
+                                    {
+                                        let short_query = if query.len() > 40 {
+                                            format!("{}...", &query[..40])
+                                        } else {
+                                            query.to_string()
+                                        };
+                                        format!("search: {}", short_query)
+                                    } else {
+                                        "web_search".to_string()
+                                    }
+                                }
                                 "Skill" => {
                                     if let Some(skill) = input.get("skill").and_then(|v| v.as_str())
                                     {
@@ -1323,6 +1506,11 @@ fn execute_tool(
                 "Error: Missing 'path' parameter".to_string()
             }
         }
+        "web_search" => {
+            // Note: web_search is async, so we return a placeholder
+            // It will be handled in execute_tool_async
+            "Error: web_search must be called via execute_tool_async".to_string()
+        }
         "TodoWrite" => {
             if let Some(items_value) = input.get("items") {
                 match serde_json::from_value::<Vec<TodoItem>>(items_value.clone()) {
@@ -1370,6 +1558,38 @@ async fn execute_tool_async(
             agent_type,
         )
         .await
+    } else if name == "web_search" {
+        let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let max_results = input
+            .get("max_results")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(5) as usize;
+
+        match web_search(query, max_results).await {
+            Ok(results) => {
+                if results.is_empty() {
+                    format!("No search results found for: {}", query)
+                } else {
+                    let formatted: String = results
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            format!(
+                                "{}. **{}**\n   URL: {}\n   {}\n",
+                                i + 1,
+                                r.title,
+                                r.url,
+                                r.snippet
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    format!("## Search Results for: {}\n\n{}", query, formatted)
+                }
+            }
+            Err(e) => format!("Error performing web search: {}", e),
+        }
     } else {
         execute_tool(config, todo_manager, skill_loader, name, input)
     }
@@ -1507,6 +1727,7 @@ async fn agent_loop(
                         "Skill" => format!("{} {}", ">".bright_blue(), name.bright_green()),
                         "TodoWrite" => format!("{} {}", ">".bright_blue(), name.bright_magenta()),
                         "bash" => format!("{} {}", ">".bright_blue(), name.bright_yellow()),
+                        "web_search" => format!("{} {}", ">".bright_blue(), name.bright_cyan()),
                         _ => format!("{} {}", ">".bright_blue(), name.bright_cyan()),
                     };
                     println!("\n{}", tool_display);
@@ -1522,7 +1743,11 @@ async fn agent_loop(
                     .await;
 
                     // Display output
-                    let preview = if name == "TodoWrite" || name == "Task" || name == "Skill" {
+                    let preview = if name == "TodoWrite"
+                        || name == "Task"
+                        || name == "Skill"
+                        || name == "web_search"
+                    {
                         output.clone()
                     } else if output.len() > 300 {
                         format!("{}...", safe_truncate(&output, 300))
@@ -1542,6 +1767,8 @@ async fn agent_loop(
                             "Skill loaded:".bright_green(),
                             preview.lines().next().unwrap_or("").bright_black()
                         );
+                    } else if name == "web_search" {
+                        println!("{}", preview.bright_black());
                     } else {
                         println!("  {}", preview.bright_black());
                     }
