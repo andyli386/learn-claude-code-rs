@@ -1,6 +1,6 @@
 # Mini Claude Code - 编码代理的渐进式实现
 
-一个通过四个版本逐步演进的项目，展示如何构建一个功能完整的 AI 编码代理。每个版本都建立在前一个版本的基础上，逐步添加功能和复杂性。
+一个通过五个版本逐步演进的项目，展示如何构建一个功能完整的 AI 编码代理。每个版本都建立在前一个版本的基础上，逐步添加功能和复杂性。
 
 ## 项目概览
 
@@ -10,7 +10,8 @@
 - **v1_basic_agent**: 基础代理 - 添加 4 个核心工具
 - **v2_todo_agent**: 高级代理 - 增加任务规划和可见性
 - **v3_subagent**: 子代理机制 - 通过上下文隔离解决复杂任务
-- **v4_skills_agent**: 技能机制 - 知识外部化，按需加载专业领域知识
+- **v4_skills_agent**: 技能机制 + 网络搜索 - 知识外部化 + DuckDuckGo 搜索
+- **v5_mcp_agent**: MCP 浏览器集成 - 通过 Chrome DevTools 实现浏览器自动化
 
 每个版本都是完全可用的，展示了从简单到复杂的设计演进。
 
@@ -31,26 +32,18 @@
 
 星号 (*) 很重要！模型会**反复调用工具**，直到它认为任务完成。这将聊天机器人转变为自主代理。
 
-### 为什么选择 Rust？
-
-- **类型安全**: 编译时捕获错误
-- **性能**: 零成本抽象，高效执行
-- **并发**: Tokio 异步运行时，轻松处理多任务
-- **可靠性**: 内存安全，适合长时间运行的代理
-
 ## 版本对比
 
-| 特性 | v0_bash_agent | v1_basic_agent | v2_todo_agent | v3_subagent | v4_skills_agent |
-|------|--------------|----------------|---------------|-------------|-----------------|
-| 工具数量 | 1 (bash) | 4 (bash + 文件操作) | 5 (增加 TodoWrite) | 6 (增加 Task) | 7 (增加 Skill) |
-| 代码行数 | ~200 行 | ~500 行 | ~850 行 | ~1400 行 | ~1700 行 |
-| 单元测试 | 10 个 | 12 个 | 29 个 | 27 个 | 待补充 |
-| Clippy 警告 | 0 ✅ | 0 ✅ | 0 ✅ | 0 ✅ | 0 ✅ |
-| 子代理支持 | ✅ 进程级隔离 | ❌ | ❌ | ✅ 上下文隔离 | ✅ 上下文隔离 |
-| 任务规划 | ❌ | ❌ | ✅ 可见任务列表 | ✅ 可见任务列表 | ✅ 可见任务列表 |
-| 技能加载 | ❌ | ❌ | ❌ | ❌ | ✅ 按需加载专业知识 |
-| 子代理技能 | ❌ | ❌ | ❌ | ❌ | ✅ 支持 |
-| 适用场景 | 快速原型、单步任务 | 日常编码 | 复杂重构、多步骤任务 | 超大型任务、探索+实现 | 需要专业领域知识的任务 |
+| 特性 | v0 | v1 | v2 | v3 | v4 | v5 |
+|------|----|----|----|----|----|----|
+| 工具数量 | 1 | 4 | 5 | 6 | 7 | 11 |
+| 代码行数 | ~200 | ~500 | ~850 | ~1400 | ~1700 | ~2050 |
+| 子代理支持 | ✅ 进程级 | ❌ | ❌ | ✅ 上下文隔离 | ✅ 上下文隔离 | ✅ 上下文隔离 |
+| 任务规划 | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| 技能加载 | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| **网络搜索** | ❌ | ❌ | ❌ | ❌ | **✅ DuckDuckGo** | **✅ DuckDuckGo** |
+| **浏览器自动化** | ❌ | ❌ | ❌ | ❌ | ❌ | **✅ MCP + Chrome** |
+| 适用场景 | 快速原型 | 日常编码 | 复杂重构 | 超大型任务 | 需要专业知识 | 需要浏览器交互 |
 
 ## 快速开始
 
@@ -58,13 +51,14 @@
 
 - Rust 1.70+ (建议使用 stable)
 - API Key for Anthropic Claude
+- (v5) Node.js 20+ + Chrome/Edge 浏览器
 
 ### 安装
 
 ```bash
 # 克隆项目
 git clone <repo-url>
-cd mini-code
+cd learn-claude-code-rs
 
 # 复制环境变量配置
 cp .env.example .env
@@ -73,9 +67,9 @@ cp .env.example .env
 # ANTHROPIC_API_KEY=your_key_here
 ```
 
-### 运行
+### 运行各个版本
 
-#### v0 - 极简代理 (推荐用于快速任务)
+#### v0 - 极简代理 (~200 行)
 
 ```bash
 # 交互模式
@@ -83,380 +77,417 @@ cargo run --bin v0_bash_agent
 
 # 子代理模式（一次性执行任务）
 cargo run --bin v0_bash_agent -- "分析 src/ 目录结构"
-
-# 使用不同的模型
-cargo run --bin v0_bash_agent -- opus "审查代码质量"
 ```
 
-#### v1 - 基础代理（日常编码）
+#### v1 - 基础代理 (~500 行)
 
 ```bash
 cargo run --bin v1_basic_agent
 ```
 
-#### v2 - 高级代理（复杂任务）
+#### v2 - 高级代理 (~850 行)
 
 ```bash
-# 默认启用 readline 支持（更好的 UTF-8 输入）
 cargo run --bin v2_todo_agent
-
-# 不使用 readline
-cargo run --bin v2_todo_agent --no-default-features
 ```
 
-#### v3 - 子代理机制（超大型任务）
+#### v3 - 子代理机制 (~1400 行)
 
 ```bash
-# 运行（默认启用 readline 支持）
 cargo run -p v3_subagent
-
-# 不使用 readline
-cargo run -p v3_subagent --no-default-features
 ```
 
-#### v4 - 技能机制（专业领域知识）
+#### v4 - 技能 + 网络搜索 (~1700 行)
 
 ```bash
-# 运行（默认启用 readline 支持）
 cargo run -p v4_skills_agent
-
-# 不使用 readline
-cargo run -p v4_skills_agent --no-default-features
 ```
 
-**创建技能**:
+**特性**:
+- ✅ 技能加载（PDF、MCP、代码审查等）
+- ✅ **DuckDuckGo 网络搜索**
+- ✅ 子代理技能支持
+
+**使用搜索**:
+```
+You: 搜索最新的 Rust async 编程最佳实践
+
+> web_search "Rust async programming best practices 2025"
+  返回 5 条搜索结果...
+```
+
+#### v5 - MCP 浏览器集成 (~2050 行) ⭐ 最新
+
 ```bash
-# 创建技能目录
-mkdir -p skills/my-skill
+# 1. 安装 chrome-devtools-mcp
+npm install -g chrome-devtools-mcp
 
-# 创建 SKILL.md
-cat > skills/my-skill/SKILL.md << 'EOF'
----
-name: my-skill
-description: 技能简短描述
----
+# 2. 启动 Chrome（带远程调试）
+# Windows:
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
 
-# 我的技能
+# Linux/macOS:
+google-chrome --remote-debugging-port=9222
+# 或 headless 模式:
+google-chrome --headless --remote-debugging-port=9222
 
-详细的使用说明...
-EOF
+# 3. 运行程序
+cargo run -p v5_mcp_agent
 ```
+
+**新增浏览器工具**:
+- `browser_navigate` - 导航到 URL
+- `browser_screenshot` - 截取页面截图
+- `browser_snapshot` - 获取页面文本内容（基于 a11y 树）
+- `browser_get_performance` - 获取性能指标
+
+**使用示例**:
+```
+You: 访问 https://example.com 并截图
+
+> browser_navigate https://example.com
+  ✅ 已导航到 https://example.com
+
+> browser_screenshot
+  ✅ 截图已完成
+
+> browser_snapshot
+  ✅ 页面内容:
+  Example Domain
+  This domain is for use in illustrative examples...
+```
+
+**完整工具列表**:
+- bash, read_file, write_file, edit_file
+- TodoWrite, Task, Skill
+- web_search
+- **browser_navigate, browser_screenshot, browser_snapshot, browser_get_performance**
 
 ## 版本详解
 
-### v0: Bash 是万能的
+### v4: 技能机制 + 网络搜索
 
-**核心哲学**: Unix 哲学说一切皆文件，一切可管道。Bash 是通往这个世界的门户。
-
-**设计洞察**:
-- 单一工具 (bash) + 单一循环 = 完整的代理能力
-- 通过 bash 调用自身实现子代理（进程隔离 = 上下文隔离）
-- 代码简洁 (~200 行)，易于理解和修改
-
-**工具映射**:
-
-| 你需要 | Bash 命令 |
-|--------|-----------|
-| 读文件 | cat, head, tail, grep |
-| 写文件 | echo '...' > file, cat << 'EOF' > file |
-| 搜索 | find, grep, rg, ls |
-| 执行 | cargo, npm, make, 任何命令 |
-| **子代理** | v0_bash_agent "task" |
-
-**何时使用**:
-- 快速原型开发
-- 简单的文件操作
-- 需要隔离的子任务
-- 学习代理的基本原理
-
-### v1: 模型即代理
-
-**核心哲学**: 代码只是提供工具和运行循环，模型才是决策者。
-
-**新增内容**:
-- 4 个核心工具：bash, read_file, write_file, edit_file
-- 工具结果截断（防止上下文溢出）
-- 路径安全检查（防止访问工作区外的文件）
-- UTF-8 安全截断
-- 思考动画（改善用户体验）
-- 10 分钟超时保护
-- 友好的错误提示
-
-**工具设计**:
-
-| 工具 | 用途 | 示例 |
-|------|------|------|
-| bash | 运行任何命令 | npm install, git status |
-| read_file | 读取文件内容 | 查看 src/main.rs |
-| write_file | 创建/覆盖文件 | 创建 README.md |
-| edit_file | 精确修改 | 替换一个函数 |
-
-**何时使用**:
-- 日常编码任务
-- 需要精确的文件编辑
-- 需要更好的安全性
-- 多步骤的简单任务
-
-### v2: 可见规划
-
-**核心哲学**: "让计划可见" - 结构既约束又赋能。
-
-**新增内容**:
-- TodoWrite 工具：创建可见的任务列表
-- 任务约束（最多 20 项，最多 1 个进行中）
-- 强制字段（content, status, activeForm）
-- 实时进度跟踪
-- 更智能的系统提示（包含工作流指导）
-- Readline 支持（可选，改善 UTF-8 输入）
-- 任务提醒（超过 10 次工具调用未更新）
-
-**TodoWrite 工具示例**:
-
-```json
-{
-  "items": [
-    {
-      "content": "读取和分析代码库结构",
-      "status": "in_progress",
-      "activeForm": "正在分析代码库结构"
-    },
-    {
-      "content": "识别关键组件和模式",
-      "status": "pending",
-      "activeForm": "识别组件中"
-    },
-    {
-      "content": "编写分析报告",
-      "status": "pending",
-      "activeForm": "编写报告中"
-    }
-  ]
-}
-```
-
-**显示效果**:
-
-```
-[x] 已完成的任务
-[>] 进行中的任务 <- 正在做这个...
-[ ] 待处理任务
-
-(1/3 completed)
-```
-
-**约束的价值**:
-- 最多 20 项 → 防止无限任务列表
-- 只能 1 个进行中 → 强制专注
-- 必需字段 → 确保结构化输出
-
-**何时使用**:
-- 复杂的多步骤任务
-- 需要明确规划的重构
-- 想要看到代理的思考过程
-- 长时间运行的任务
-
-### v3: 上下文隔离
-
-**核心哲学**: "分而治之" - 通过子代理隔离上下文，解决大型任务的上下文污染问题。
-
-**新增内容**:
-- Task 工具：生成具有隔离上下文的子代理
-- Agent 类型注册表：explore, code, plan
-- 工具过滤：根据代理类型限制可用工具
-- 进度追踪：实时显示子代理执行状态
-
-**代理类型**:
-
-| 类型 | 工具 | 用途 |
-|------|------|------|
-| explore | bash, read_file | 只读探索和分析 |
-| code | 所有工具 | 完整的实现和修改 |
-| plan | bash, read_file | 设计规划，不修改 |
-
-**工作流程示例**:
-
-```
-用户: 重构 auth 模块以使用 JWT
-
-主代理:
-  > Task(explore): "查找所有 auth 相关文件"
-    [explore] 5 个工具, 3.2s
-    -> 返回: "Auth 在 src/auth/login.rs..."
-
-  > Task(plan): "设计 JWT 迁移"
-    [plan] 3 个工具, 1.8s
-    -> 返回: "1. 添加 jwt 库 2. 创建 utils..."
-
-  > Task(code): "实现 JWT"
-    [code] 8 个工具, 5.4s
-    -> 返回: "已创建 jwt_utils.rs..."
-
-  完成！
-```
-
-**关键优势**:
-- **上下文隔离**: 子代理在独立上下文中运行，不污染主对话
-- **工具限制**: explore 和 plan 类型不能修改文件
-- **并行可能**: 可以同时运行多个子代理（未来）
-- **自然分解**: 大任务自然分解为小任务
-
-**何时使用**:
-- 超大型任务（探索 → 规划 → 实现）
-- 需要先探索再修改的场景
-- 多阶段的复杂重构
-- 需要保持主对话清晰的任务
-
-### v4: 知识外部化
-
-**核心哲学**: "技能即知识" - 将专业领域知识存储在文件中，按需加载，而非锁定在模型参数中。
+**核心哲学**: "技能即知识" + "互联网是最大的知识库"
 
 **新增内容**:
 - Skill 工具：按需加载专业领域知识
-- SkillLoader：解析 SKILL.md 文件（YAML frontmatter + Markdown body）
-- 渐进式披露：三层架构（元数据 → 内容 → 资源）
-- 缓存保护注入：通过 tool_result 注入技能，保持 system prompt 不变
+- **web_search 工具：DuckDuckGo 搜索集成**
+- SkillLoader：解析 SKILL.md 文件
+- 渐进式披露架构
 
 **技能结构**:
 
 ```
 skills/
 ├── pdf/
-│   ├── SKILL.md          # 必需：YAML + Markdown
-│   ├── scripts/          # 可选：辅助脚本
-│   └── references/       # 可选：参考文档
-└── mcp-builder/
-    └── SKILL.md
+│   ├── SKILL.md          # PDF 处理技能
+│   └── scripts/
+├── mcp-builder/
+│   └── SKILL.md          # MCP 服务器开发技能
+└── code-review/
+    └── SKILL.md          # 代码审查技能
 ```
 
-**SKILL.md 格式**:
+**web_search 工具**:
 
-```markdown
----
-name: pdf
-description: 处理 PDF 文件。用于读取、创建或合并 PDF。
----
+使用 DuckDuckGo HTML 抓取实现免费搜索，无需 API Key。
 
-# PDF 处理技能
-
-## 读取 PDF
-
-使用 pdftotext 快速提取：
-\```bash
-pdftotext input.pdf -
-\```
-
-复杂表格使用 PyMuPDF：
-\```python
-import fitz
-doc = fitz.open("input.pdf")
-for page in doc:
-    print(page.get_text())
-\```
+```rust
+// 搜索参数
+{
+  "query": "搜索关键词",
+  "max_results": 5  // 可选，默认 5
+}
 ```
 
-**渐进式披露**:
+**搜索策略**:
+1. 解析 DuckDuckGo HTML 响应
+2. 提取真实 URL（去除重定向）
+3. 去重并限制结果数量
+4. 返回标题、URL、摘要
 
+**示例**:
 ```
-Layer 1: 元数据（始终加载）         ~100 tokens/skill
-         仅 name + description
+You: 搜索 Rust MCP 协议实现
 
-Layer 2: SKILL.md 内容（触发时）    ~2000 tokens
-         详细指令
+> web_search
+  ## Search Results for: Rust MCP 协议实现
 
-Layer 3: 资源（按需）               无限制
-         scripts/, references/, assets/
+  1. **Model Context Protocol**
+     URL: https://modelcontextprotocol.io/
+     MCP 官方协议规范...
+
+  2. **rust-mcp on GitHub**
+     URL: https://github.com/...
+     Rust MCP 实现示例...
 ```
-
-**工作流程示例**:
-
-```
-用户: 帮我从 PDF 提取文本
-
-主代理:
-  > Skill pdf
-    加载技能: # Skill: pdf
-
-  > bash pdftotext document.pdf -
-    [PDF 文本内容...]
-
-  提取成功！PDF 包含...
-```
-
-**关键优势**:
-- **知识外部化**: 专业知识存储在可编辑文件中
-- **零训练成本**: 添加新技能只需写 Markdown 文件
-- **缓存友好**: 技能通过 tool_result 注入，不污染缓存
-- **可扩展**: 任何人都可以创建技能
-
-**工具 vs 技能**:
-
-| 概念 | 是什么 | 示例 |
-|------|--------|------|
-| **工具** | 模型能做什么 | bash, read_file, write |
-| **技能** | 模型如何知道 | PDF 处理, MCP 开发 |
-
-工具是能力，技能是知识。
 
 **何时使用**:
-- 需要特定领域专业知识（PDF、MCP、代码审查）
-- 想要标准化工作流程
-- 需要分享最佳实践
-- 构建可复用的知识库
+- 需要最新信息（超出模型训练数据）
+- 查找文档、教程、API 参考
+- 技术问题排查
+- 竞品调研
+
+### v5: MCP 浏览器集成
+
+**核心哲学**: "浏览器是最强大的数据采集工具"
+
+**新增内容**:
+- MCP Client：连接到 chrome-devtools-mcp
+- 4 个浏览器工具（navigate, screenshot, snapshot, performance）
+- Windows/Linux 跨平台支持
+- JSON-RPC 通信协议
+
+**架构**:
+
+```
+┌─────────────────────────────────────────────┐
+│            v5_mcp_agent (Rust)              │
+│  ┌──────────────┐  ┌───────────────────┐   │
+│  │ Claude AI    │  │  MCP Client       │   │
+│  │  (决策)      │─→│  (浏览器控制)    │   │
+│  └──────────────┘  └───────────────────┘   │
+└─────────────────────────────────────────────┘
+                      │ JSON-RPC
+                      ↓
+┌─────────────────────────────────────────────┐
+│      chrome-devtools-mcp (Node.js)          │
+│         Chrome DevTools Protocol            │
+└─────────────────────────────────────────────┘
+                      │ CDP
+                      ↓
+┌─────────────────────────────────────────────┐
+│           Chrome/Edge Browser               │
+└─────────────────────────────────────────────┘
+```
+
+**MCP 工具详解**:
+
+| 工具 | 功能 | MCP 对应工具 |
+|------|------|--------------|
+| browser_navigate | 访问 URL | navigate_page |
+| browser_screenshot | 截图 | take_screenshot |
+| browser_snapshot | 获取页面内容 | take_snapshot |
+| browser_get_performance | 性能分析 | performance_start_trace + performance_stop_trace |
+
+**跨平台支持**:
+
+代码自动检测操作系统并适配：
+- **Windows**: 通过 `cmd /C` 执行 npx
+- **Linux/macOS**: 直接执行 npx
+
+```rust
+let command = if cfg!(target_os = "windows") {
+    Command::new("cmd").args(["/C", "npx", ...])
+} else {
+    Command::new("npx").args([...])
+};
+```
+
+**使用场景**:
+
+1. **网页数据采集**
+```
+You: 访问新闻网站并提取标题
+
+> browser_navigate https://news.example.com
+> browser_snapshot
+  提取到 10 条新闻标题...
+```
+
+2. **性能监控**
+```
+You: 分析网站加载性能
+
+> browser_navigate https://yoursite.com
+> browser_get_performance
+  FCP: 1.2s, LCP: 2.3s, CLS: 0.05
+```
+
+3. **自动化测试**
+```
+You: 测试登录流程
+
+> browser_navigate https://app.example.com/login
+> browser_snapshot
+  检测到登录表单，元素 ID: uid-123, uid-456
+> (继续填写表单...)
+```
+
+**配置要求**:
+
+1. **安装 chrome-devtools-mcp**:
+```bash
+npm install -g chrome-devtools-mcp
+```
+
+2. **启动 Chrome**:
+```bash
+# 带界面
+chrome --remote-debugging-port=9222
+
+# 无界面（headless）
+chrome --headless --remote-debugging-port=9222 --no-sandbox
+```
+
+3. **验证连接**:
+```bash
+curl http://localhost:9222/json/version
+```
+
+应该看到 JSON 响应，包含 Chrome 版本信息。
+
+**故障排查**:
+
+如果遇到 "chrome-devtools-mcp not found"：
+- 检查 Node.js 版本（需要 20+）
+- 确认 npm 全局路径在 PATH 中
+- Windows 用户：确保使用 PowerShell 或 CMD
+
+如果遇到 "Target closed" 错误：
+- 重启 Chrome（带 --remote-debugging-port=9222）
+- 重启 v5_mcp_agent 程序
+- 检查端口 9222 是否被占用
+
+**何时使用 v5**:
+- 需要从网页提取数据
+- 需要与 Web 应用交互
+- 需要测试前端性能
+- 需要自动化浏览器任务
+- 需要获取动态渲染的内容（AJAX、SPA）
+
+## 环境变量
+
+创建 `.env` 文件（参考 `.env.example`）：
+
+```bash
+# 必需：API Key
+ANTHROPIC_API_KEY=your_api_key_here
+
+# 可选：自定义 API Base URL
+ANTHROPIC_API_BASE=https://api.anthropic.com
+
+# 可选：模型选择
+MODEL_NAME=claude-sonnet-4-5-20250929
+
+# 可选：最大输出 tokens
+MINI_CODE_MAX_OUTPUT_TOKENS=160000
+
+# 可选：截断重试次数
+MINI_CODE_MAX_TRUNCATION_RETRIES=3
+```
+
+支持的模型：
+- `claude-sonnet-4-5-20250929` (更快，推荐)
+- `claude-opus-4-5-20251101` (更强大)
+
+## 测试
+
+```bash
+# 运行所有测试
+cargo test --workspace
+
+# 运行特定版本的测试
+cargo test -p v4_skills_agent
+cargo test -p v5_mcp_agent
+
+# v2 和 v3 的环境变量测试需要单线程运行
+cargo test -p v2_todo_agent -- --test-threads=1
+cargo test -p v3_subagent -- --test-threads=1
+```
+
+## 使用示例
+
+### 示例 1: 网络搜索 + 代码生成 (v4)
+
+```
+You: 搜索 Rust tokio select 用法并给我写个示例
+
+> web_search "Rust tokio select usage example"
+  [搜索结果...]
+
+> write_file examples/tokio_select.rs
+  [生成代码...]
+
+完成！示例已保存到 examples/tokio_select.rs
+```
+
+### 示例 2: 浏览器自动化 (v5)
+
+```
+You: 访问 GitHub trending 页面并提取前 5 个项目
+
+> browser_navigate https://github.com/trending
+  ✅ 已导航
+
+> browser_snapshot
+  ✅ 获取页面内容
+
+提取到的项目:
+1. project-a/repo-name - 123 stars today
+2. project-b/repo-name - 98 stars today
+...
+```
+
+### 示例 3: 搜索 + 浏览器验证 (v5)
+
+```
+You: 搜索最新的 Next.js 文档，访问官网并截图
+
+> web_search "Next.js official documentation"
+  找到: https://nextjs.org/docs
+
+> browser_navigate https://nextjs.org/docs
+  ✅ 已导航
+
+> browser_screenshot
+  ✅ 截图已保存
+
+> browser_snapshot
+  文档包含以下章节: Getting Started, Routing, ...
+```
+
+## 性能考虑
+
+- **超时**: 默认 10 分钟超时保护（可通过环境变量配置）
+- **输出截断**: 工具输出限制在 50KB
+- **UTF-8 安全**: 字符边界对齐的截断
+- **路径验证**: 防止访问工作区外的文件
+- **MCP 延迟**: 每次浏览器操作约 50-200ms
+
+## 安全特性
+
+- **路径验证**: 所有文件操作限制在工作区内
+- **危险命令拦截**: 阻止 `rm -rf /` 等危险操作
+- **进程隔离**: v0 的子代理在独立进程中运行
+- **只读默认**: 文件操作需要明确的工具调用
+- **浏览器沙箱**: Chrome 运行在受限环境
 
 ## 架构设计
 
 ### 工作空间结构
 
 ```
-mini-code/
+learn-claude-code-rs/
 ├── Cargo.toml                 # Workspace 配置
 ├── crates/
 │   ├── v0_bash_agent/        # 极简版本
-│   │   ├── src/
-│   │   │   ├── main.rs       # 二进制入口
-│   │   │   ├── lib.rs        # 库代码（可测试）
-│   │   │   └── bin/          # 辅助工具
-│   │   └── Cargo.toml
 │   ├── v1_basic_agent/       # 基础版本
-│   │   ├── src/
-│   │   │   └── main.rs       # 完整实现 + 测试
-│   │   └── Cargo.toml
 │   ├── v2_todo_agent/        # 高级版本
-│   │   ├── src/
-│   │   │   └── main.rs       # 完整实现 + 测试
-│   │   └── Cargo.toml
 │   ├── v3_subagent/          # 子代理版本
-│   │   ├── src/
-│   │   │   └── main.rs       # 完整实现 + 子代理支持
-│   │   ├── Cargo.toml
-│   │   └── README.md         # 详细文档
-│   └── v4_skills_agent/      # 技能版本
+│   ├── v4_skills_agent/      # 技能 + 搜索版本
+│   └── v5_mcp_agent/         # MCP 浏览器版本
 │       ├── src/
-│       │   └── main.rs       # 完整实现 + 技能加载
-│       ├── Cargo.toml
-│       └── README.md         # 详细文档
-├── skills/                   # 技能目录（可选，用于 v4）
+│       │   ├── main.rs       # 主程序
+│       │   └── mcp_client.rs # MCP 客户端
+│       └── README.md
+├── skills/                   # 技能目录
 │   ├── pdf/
-│   │   └── SKILL.md
-│   └── mcp-builder/
-│       └── SKILL.md
-├── .env.example              # 环境变量模板
+│   ├── mcp-builder/
+│   ├── code-review/
+│   └── agent-builder/
+├── .env.example
 └── README.md
-```
-
-### 共享依赖
-
-所有版本都使用 workspace 共享依赖：
-
-```toml
-[workspace.dependencies]
-anthropic = { git = "https://github.com/andyli386/anthropic-rs.git" }
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-dotenvy = "0.15"
-anyhow = "1"
-colored = "3"
 ```
 
 ### 核心循环（所有版本共享）
@@ -480,253 +511,26 @@ while not_done {
 }
 ```
 
-## 环境变量
-
-创建 `.env` 文件（参考 `.env.example`）：
-
-```bash
-# 必需：API Key
-ANTHROPIC_API_KEY=your_api_key_here
-
-# 可选：自定义 API Base URL
-ANTHROPIC_API_BASE=https://api.anthropic.com
-
-# 可选：模型选择
-MODEL_NAME=claude-sonnet-4-5-20250929
-```
-
-支持的模型：
-- `claude-sonnet-4-5-20250929` (更快，推荐)
-- `claude-opus-4-5-20251101` (更强大)
-
-## 代码质量
-
-项目通过了所有 Rust 代码质量检查：
-
-### Clippy 检查
-
-```bash
-# 检查所有 crates 的代码质量
-cargo clippy --workspace
-# ✅ 0 warnings
-
-# 查看详细修复记录
-cat WORKSPACE_CLIPPY_FIXES.md
-cat CLIPPY_FIXES.md  # v4 详细记录
-```
-
-**已修复的警告类型**:
-- ✅ `manual_clamp`: 使用 `.clamp()` 替代 `.max().min()`
-- ✅ `print_with_newline`: 使用 `println!()` 替代 `print!("...\n")`
-- ✅ `print_literal`: 优化 `eprintln!()` 格式
-- ✅ `unused_assignments`: 移除无用赋值
-- ✅ `useless_vec`: 数组替代 `vec![]`（常量场景）
-- ✅ `manual_range_patterns`: 使用 `.contains()` 替代范围检查
-
-详见 [WORKSPACE_CLIPPY_FIXES.md](./WORKSPACE_CLIPPY_FIXES.md) 获取完整修复记录。
-
-## 开发工具
-
-项目配置了多个开发工具：
-
-### Cargo 工具
-
-```bash
-# 依赖安全检查
-cargo deny check
-
-# 代码质量检查（已全部通过 ✅）
-cargo clippy --workspace
-
-# 拼写检查
-typos
-
-# 生成 changelog
-git cliff
-
-# 增强测试
-cargo nextest run
-```
-
-### Pre-commit 钩子
-
-```bash
-# 安装
-pipx install pre-commit
-pre-commit install
-
-# 手动运行
-pre-commit run --all-files
-```
-
-## 测试
-
-每个版本都包含单元测试：
-
-```bash
-# 运行所有测试
-cargo test --workspace
-
-# 运行特定版本的测试
-cargo test -p v0_bash_agent
-cargo test -p v1_basic_agent
-cargo test -p v4_skills_agent
-
-# v2 和 v3 的环境变量测试需要单线程运行
-cargo test -p v2_todo_agent -- --test-threads=1
-cargo test -p v3_subagent -- --test-threads=1
-
-# 使用 nextest（更快）
-cargo nextest run
-```
-
-### 测试注意事项
-
-**环境变量测试**: v2_todo_agent 和 v3_subagent 包含环境变量配置测试。由于环境变量是进程全局的，这些测试在并行运行时可能相互干扰。
-
-**解决方案**:
-```bash
-# 使用单线程运行这些测试
-cargo test -p v2_todo_agent -- --test-threads=1
-cargo test -p v3_subagent -- --test-threads=1
-```
-
-每个测试都在开始时清除环境变量以避免干扰，但单线程运行更可靠。
-
-### 测试覆盖
-
-- **v0**: bash 命令执行、系统提示生成
-- **v1**: UTF-8 截断、路径安全、工具创建
-- **v2**: TodoManager 验证、约束执行、环境配置、完整工作流
-- **v3**: Agent 类型注册、工具过滤、子代理隔离、环境配置
-- **v4**: SkillLoader、技能解析、工具集成
-
-## 使用示例
-
-### 示例 1: 快速文件分析 (v0)
-
-```bash
-cargo run --bin v0_bash_agent -- "找出所有 .rs 文件并统计行数"
-```
-
-代理会执行：
-```bash
-find . -name "*.rs"
-wc -l $(find . -name "*.rs")
-```
-
-### 示例 2: 代码重构 (v1)
-
-```
-你: 将 config.rs 中的 Config 结构体重命名为 Configuration
-
-代理:
-> read_file config.rs
-> edit_file config.rs "struct Config" "struct Configuration"
-> edit_file config.rs "impl Config" "impl Configuration"
-> grep -r "Config::" src/
-> (报告完成)
-```
-
-### 示例 3: 复杂重构 (v2)
-
-```
-你: 重构认证模块，添加测试，更新文档
-
-代理:
-TodoWrite: [
-  [x] 分析当前认证实现
-  [>] 编写单元测试
-  [ ] 更新文档
-]
-
-> read_file src/auth.rs
-> write_file src/auth_test.rs ...
-> (继续执行)
-```
-
-### 示例 4: 大型重构 (v3)
-
-```
-你: 重构整个认证系统，先探索再设计再实现
-
-代理:
-> Task
-  [explore] 查找所有认证相关文件 ... 6 tools, 4.2s
-  -> 返回: "认证代码分布在 src/auth/、src/middleware/、tests/auth/"
-
-> Task
-  [plan] 设计重构策略 ... 4 tools, 2.1s
-  -> 返回: "1. 统一到 auth/ 2. 抽象接口 3. 添加测试"
-
-> Task
-  [code] 实现重构 ... 12 tools, 8.5s
-  -> 返回: "已创建 auth/mod.rs，已迁移所有代码"
-
-完成！认证系统已重构。
-```
-
-## 性能考虑
-
-- **超时**: 所有版本都有 10 分钟超时保护
-- **输出截断**: 工具输出限制在 50KB 以防止上下文溢出
-- **UTF-8 安全**: 字符边界对齐的截断，防止无效 UTF-8
-- **路径验证**: 防止访问工作区外的文件
-
-## 安全特性
-
-- **路径验证**: 所有文件操作限制在工作区内
-- **危险命令拦截**: 阻止 `rm -rf /` 等危险操作
-- **进程隔离**: v0 的子代理在独立进程中运行
-- **只读默认**: 文件操作需要明确的工具调用
-
-## 故障排查
-
-### API 错误
-
-```
-API Error: insufficient balance
-Hint: Your API account balance is insufficient. Please recharge.
-```
-
-**解决方案**: 检查 API 账户余额
-
-### 超时错误
-
-```
-API Error: Request timed out after 10 minutes
-Hint: Request timed out. The task may be too complex or the API server is slow.
-```
-
-**解决方案**: 将任务分解为更小的子任务
-
-### UTF-8 输入问题
-
-如果遇到 UTF-8 字符输入问题，使用 v2 的 readline 特性：
-
-```bash
-cargo run --bin v2_todo_agent --features readline
-```
-
 ## 学习路径
 
 建议按顺序阅读和运行每个版本：
 
-1. **先运行 v0**: 理解代理的基本循环
-2. **阅读 v0 代码**: 注意 `chat()` 函数中的循环
-3. **运行 v1**: 体验更多工具的便利
-4. **比较 v0 和 v1**: 看看 4 个工具如何改变体验
-5. **运行 v2**: 尝试复杂任务
-6. **阅读 v2 代码**: 理解 TodoWrite 如何实现可见规划
-7. **运行 v3**: 体验子代理的上下文隔离
-8. **阅读 v3 代码**: 理解 Task 工具如何实现子代理机制
+1. **v0**: 理解代理的基本循环（~200 行代码）
+2. **v1**: 体验更多工具的便利（+300 行）
+3. **v2**: 尝试复杂任务的规划（+350 行）
+4. **v3**: 体验子代理的上下文隔离（+550 行）
+5. **v4**: 使用技能和搜索功能（+300 行）
+6. **v5**: 探索浏览器自动化（+350 行）
+
+每个版本都是完整可用的，可以独立运行。
 
 ## 贡献
 
 欢迎贡献！特别是：
 
 - 添加新的工具实现
-- 改进错误处理
+- 改进 MCP 集成
+- 添加更多技能
 - 增加测试覆盖
 - 优化性能
 - 改进文档
@@ -739,62 +543,21 @@ MIT License
 
 本项目受到以下项目的启发：
 - Anthropic Claude Code
+- Model Context Protocol (MCP)
+- Chrome DevTools Protocol
 - Cursor AI
-- OpenAI Codex
-
-## 相关文档
-
-### 功能改进
-- [TIMEOUT_IMPROVEMENTS.md](./TIMEOUT_IMPROVEMENTS.md) - 超时处理改进
-- [UTF8_TRUNCATION_FIX.md](./UTF8_TRUNCATION_FIX.md) - UTF-8 截断修复
-- [ERROR_HANDLING_IMPROVEMENTS.md](./ERROR_HANDLING_IMPROVEMENTS.md) - 错误处理改进
-- [UI_IMPROVEMENTS.md](./UI_IMPROVEMENTS.md) - UI 改进
-- [UNIT_TESTS.md](./UNIT_TESTS.md) - 单元测试说明
-
-### 代码质量
-- [WORKSPACE_CLIPPY_FIXES.md](./WORKSPACE_CLIPPY_FIXES.md) - 完整工作空间 Clippy 警告修复记录
-- [CLIPPY_FIXES.md](./CLIPPY_FIXES.md) - v4_skills_agent 详细修复记录
-- [CRASH_FIX_SUMMARY.md](./CRASH_FIX_SUMMARY.md) - Token 管理修复
-
-### 新特性
-- [SUBAGENT_SKILLS_SUPPORT.md](./SUBAGENT_SKILLS_SUPPORT.md) - 子代理技能支持说明
-- [ENV_CONFIG_QUICK.md](./ENV_CONFIG_QUICK.md) - 环境变量配置参考
-
-## 常见问题
-
-### Q: 为什么有三个版本？
-
-A: 每个版本展示了不同的设计权衡。v0 最简单，v1 平衡功能与复杂性，v2 最强大。你可以根据需求选择合适的版本。
-
-### Q: 哪个版本最适合生产使用？
-
-A: 取决于你的需求：
-- 简单脚本和快速任务 → v0
-- 日常编码 → v1
-- 复杂项目重构 → v2
-- 超大型任务，需要探索和实现分离 → v3
-
-### Q: 可以添加自己的工具吗？
-
-A: 可以！每个版本的工具都是明确定义的。参考现有工具的实现，添加新的工具到 `create_tools()` 函数。
-
-### Q: 支持其他 LLM 提供商吗？
-
-A: 目前仅支持 Anthropic Claude。但架构是通用的，可以适配其他提供商。
-
-### Q: 如何调试工具调用？
-
-A: 所有版本都会打印工具调用和结果。查看输出中的 `> tool_name` 行。
 
 ## 总结
 
 这个项目展示了构建 AI 编码代理的演进过程：
 
-1. **v0**: 证明最小可行性（1 个工具）
-2. **v1**: 添加实用工具（4 个工具）
-3. **v2**: 增加规划能力（5 个工具 + 可见性）
-4. **v3**: 上下文隔离（6 个工具 + 子代理）
+1. **v0**: 证明最小可行性（1 个工具，~200 行）
+2. **v1**: 添加实用工具（4 个工具，~500 行）
+3. **v2**: 增加规划能力（5 个工具 + 可见性，~850 行）
+4. **v3**: 上下文隔离（6 个工具 + 子代理，~1400 行）
+5. **v4**: 知识外部化 + 网络搜索（7 个工具，~1700 行）
+6. **v5**: 浏览器自动化（11 个工具，~2050 行）
 
 关键洞察：代理的复杂性来自工具，而非模型。模型本身就是决策引擎。
 
-从 ~200 行代码开始，逐步构建你自己的编码代理！
+从 ~200 行代码开始，逐步构建你自己的编码代理！🚀
