@@ -1447,7 +1447,13 @@ Complete the task and return a clear, concise summary."#,
                                     if let Some(cmd) = input.get("command").and_then(|v| v.as_str())
                                     {
                                         let short_cmd = if cmd.len() > 60 {
-                                            format!("{}...", &cmd[..60])
+                                            // Safe UTF-8 truncation - find character boundary
+                                            let safe_end = cmd
+                                                .char_indices()
+                                                .find(|(i, _)| *i >= 60)
+                                                .map(|(i, _)| i)
+                                                .unwrap_or(cmd.len());
+                                            format!("{}...", &cmd[..safe_end])
                                         } else {
                                             cmd.to_string()
                                         };
@@ -1481,7 +1487,13 @@ Complete the task and return a clear, concise summary."#,
                                     if let Some(query) = input.get("query").and_then(|v| v.as_str())
                                     {
                                         let short_query = if query.len() > 40 {
-                                            format!("{}...", &query[..40])
+                                            // Safe UTF-8 truncation - find character boundary
+                                            let safe_end = query
+                                                .char_indices()
+                                                .find(|(i, _)| *i >= 40)
+                                                .map(|(i, _)| i)
+                                                .unwrap_or(query.len());
+                                            format!("{}...", &query[..safe_end])
                                         } else {
                                             query.to_string()
                                         };
