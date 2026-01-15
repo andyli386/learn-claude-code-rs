@@ -603,35 +603,55 @@ fn run_bash(workdir: &Path, command: &str) -> String {
 
 fn run_read(workdir: &Path, path: &str, limit: Option<i64>) -> String {
     match safe_path(workdir, path) {
-        Ok(safe_path) => match fs::read_to_string(&safe_path) {
-            Ok(content) => {
-                let lines: Vec<&str> = content.lines().collect();
-                let total_lines = lines.len();
+        Ok(safe_path) => {
+            // Read file as raw bytes first to handle non-UTF8 content gracefully
+            match fs::read(&safe_path) {
+                Ok(bytes) => {
+                    // Check for non-UTF8 bytes
+                    let has_invalid_utf8 = bytes.iter().any(|&b| b > 0x7F && !b.is_ascii());
 
-                let output = if let Some(limit) = limit {
-                    if limit > 0 && (limit as usize) < total_lines {
-                        let limited_lines: Vec<&str> =
-                            lines.iter().take(limit as usize).copied().collect();
-                        format!(
-                            "{}\n... ({} more lines)",
-                            limited_lines.join("\n"),
-                            total_lines - limit as usize
-                        )
+                    let content = if has_invalid_utf8 {
+                        // Use lossy conversion to handle binary data in log files
+                        String::from_utf8_lossy(&bytes).to_string()
+                    } else {
+                        // Safe to use strict UTF-8 for pure ASCII files
+                        match String::from_utf8(bytes) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                // Fallback to lossy conversion
+                                String::from_utf8_lossy(e.as_bytes()).to_string()
+                            }
+                        }
+                    };
+
+                    let lines: Vec<&str> = content.lines().collect();
+                    let total_lines = lines.len();
+
+                    let output = if let Some(limit) = limit {
+                        if limit > 0 && (limit as usize) < total_lines {
+                            let limited_lines: Vec<&str> =
+                                lines.iter().take(limit as usize).copied().collect();
+                            format!(
+                                "{}\n... ({} more lines)",
+                                limited_lines.join("\n"),
+                                total_lines - limit as usize
+                            )
+                        } else {
+                            content
+                        }
                     } else {
                         content
-                    }
-                } else {
-                    content
-                };
+                    };
 
-                if output.len() > 50000 {
-                    format!("{}...", safe_truncate(&output, 50000))
-                } else {
-                    output
+                    if output.len() > 50000 {
+                        format!("{}...", safe_truncate(&output, 50000))
+                    } else {
+                        output
+                    }
                 }
+                Err(e) => format!("Error reading file: {}", e),
             }
-            Err(e) => format!("Error: {}", e),
-        },
+        }
         Err(e) => format!("Error: {}", e),
     }
 }
